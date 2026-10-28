@@ -82,13 +82,13 @@ function closeRoom(room, msg) {
 const publicRooms = () => [...rooms.values()].filter(r => !r.started && r.slots.some(s => s.kind === 'open')).map(r => ({
   code: r.code, host: r.slots[0].name, filled: r.slots.filter(s => s.kind !== 'open').length, total: r.slots.length, size: r.opts.size, mode: r.opts.mode }));
 
-const OPT_KEYS = { mode: ['classic', 'blitz', 'duel'], map: ['islands', 'continent'], size: ['small', 'medium', 'large'], winMode: ['last', 'domination'] };
+const OPT_KEYS = { mode: ['classic', 'blitz', 'duel', 'siege'], map: ['islands', 'continent'], size: ['small', 'medium', 'large'], winMode: ['last', 'domination'] };
 function setOpts(room, o) {
   if (!o || typeof o !== 'object') return;
   for (const k of Object.keys(OPT_KEYS)) if (OPT_KEYS[k].includes(o[k])) room.opts[k] = o[k];
   if (o.shape === 'random' || H.SHAPES.includes(o.shape)) room.opts.shape = o.shape;
   for (const k of ['diplomacy', 'allyWin', 'connectivity']) if (typeof o[k] === 'boolean') room.opts[k] = o[k];
-  if (room.opts.mode === 'duel' && room.slots.length <= 2) room.opts.diplomacy = false;     // дуэль вдвоём — без дипломатии
+  if ((room.opts.mode === 'duel' || room.opts.mode === 'siege') && room.slots.length <= 2) room.opts.diplomacy = false;     // дуэль вдвоём — без дипломатии
 }
 
 wss.on('connection', ws => {
@@ -144,7 +144,7 @@ function handle(ws, m) {
       const n = m.n | 0; if (n < 2 || n > MAX_SLOTS) return send(ws, { t: 'err', msg: 'От 2 до ' + MAX_SLOTS + ' мест' });
       if (n < room.slots.length) { if (room.slots.slice(n).some(s => s.kind === 'human')) return send(ws, { t: 'err', msg: 'Сначала освободите лишние места' }); room.slots.length = n; }
       while (room.slots.length < n) room.slots.push({ kind: 'open' });
-      if (room.opts.mode === 'duel' && n <= 2) room.opts.diplomacy = false;
+      if ((room.opts.mode === 'duel' || room.opts.mode === 'siege') && n <= 2) room.opts.diplomacy = false;
       return broadcast(room);
     }
     case 'opts': {
