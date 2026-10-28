@@ -8,12 +8,14 @@ const CFG = {
     1: { name: 'Крестьянин', cost: 10, upkeep: 2,  atk: 1, def: 1 },
     2: { name: 'Копейщик',   cost: 20, upkeep: 6,  atk: 2, def: 2 },
     3: { name: 'Барон',      cost: 30, upkeep: 18, atk: 3, def: 3 },
-    4: { name: 'Рыцарь',     cost: 40, upkeep: 36, atk: 4, def: 3 }
+    4: { name: 'Рыцарь',     cost: 40, upkeep: 36, atk: 4, def: 3 },
+    5: { name: 'Пушка',      cost: 50, upkeep: 60, atk: 0, def: 1, cannon: true }          // только в Осадном режиме: не ходит, стреляет раз в ход
   },
   buildings: {
     farm:  { name: 'Ферма',    cost: 12, costStep: 2, income: 4, upkeep: 0, def: 0 },
+    farm2: { name: 'Ферма II', cost: 30, income: 9, upkeep: 0, def: 0, upgrade: true },   // улучшение фермы (Осадный режим): cost — цена улучшения
     tower: { name: 'Башня',    cost: 15, costStep: 0, income: 0, upkeep: 1, def: 2 },
-    fort:  { name: 'Крепость', cost: 35, costStep: 0, income: 0, upkeep: 6, def: 3 }
+    fort:  { name: 'Усиленная башня', cost: 35, costStep: 0, income: 0, upkeep: 6, def: 3 }
   },
   ship: { name: 'Корабль', cost: 25, upkeep: 3, range: 5 },          // вмещает одного солдата
   res: { life: 5, density: 0.07, wood: { name: 'Лес', income: 3 }, stone: { name: 'Камень', income: 5 }, gold: { name: 'Золото', income: 10, life: 10 } },
@@ -21,15 +23,19 @@ const CFG = {
   gold: { max: 2, chance: 0.45, firstRound: 2 },
   // дуэль: фермы только рядом с другими фермами (первая — где угодно) и дороже: каждая следующая дорожнее на farmStep (в обычном режиме — на 2)
   duel: { farmStep: 6 },
+  // осадный режим = дуэль + пушки: не больше max на государство, бьют любого вражеского солдата или корабль на расстоянии до range клеток, один выстрел в ход
+  cannon: { max: 3, range: 5 },
+  // размер карты — число клеток суши (≈): малая 50, средняя 150, большая 300; число игроков карту больше не раздувает
+  mapTiles: { small: 50, medium: 150, large: 300 },
   // настройки ИИ (подобраны симуляциями бот против бота)
   ai: { farmDiv: 4, farmCap: 14, farmFree: 4, contactBase: 3, contactDiv: 10, fortV: 9, fortExtra: 3, defVal: 0.5, fortNet: 5 },
   blitz: { rounds: 10, money: 300 },
   landIncome: 1, treeIncome: 0,
   moveRange: 4,
-  startMoney: 25, startTiles: 8,
+  startMoney: 25, startTiles: 2, startNeed: 18, minLandPer: 16,       // все государства стартуют с 2 клеток; startNeed/minLandPer — сколько земли нужно на игрока при генерации
   treeDensity: 0.1, treeSpreadMin: 2, treeSpreadMax: 6,
   dominationShare: 0.7,
-  diplo: { minTreatyRounds: 2, minWarRounds: 2, proposalTTL: 3, refuseCooldown: 2, maxMoney: 500, minTerm: 2, maxTerm: 10 },
+  diplo: { minTreatyRounds: 2, minWarRounds: 2, proposalTTL: 3, refuseCooldown: 2, maxMoney: 500, minTerm: 2, maxTerm: 10, tradeIncome: 2, tradeMax: 3, loanTurns: 5, loanRate: 0.2, undoMax: 40 },
   disbandTurns: 3                       // распустить солдата можно только через столько ходов (кругов) после найма
 };
 const SHAPES = ['hex', 'round', 'rect', 'ring', 'cross', 'dumbbell', 'archipelago', 'triangle'];
@@ -57,6 +63,16 @@ function ev(G, msg) {
   if (G.events.length > 40) G.events.splice(0, G.events.length - 40);
 }
 
+// журнал нападений для стрелок на карте: кто (a) напал на кого (d), в каком раунде и на какую клетку (k)
+function noteAttack(G, a, d, k) {
+  if (a === d || a < 0 || d < 0) return;
+  const L = G.attacks || (G.attacks = []);
+  const last = L[L.length - 1];
+  if (last && last.a === a && last.d === d && last.r === G.round && !k) return;
+  L.push({ a, d, r: G.round, k: k || '' });
+  if (L.length > 40) L.splice(0, L.length - 40);
+}
+
 // соседи любой координаты: суша (G.tiles) и море (G.sea) хранятся отдельно
 function nbrs(G, t) {
   const out = [];
@@ -74,8 +90,34 @@ const tileAt = (G, k) => G.tiles.get(k) || G.sea.get(k) || null;
 // ============ Создание партии и сохранение ============
 function newGame(opts) {
   const base = (opts.seed != null ? opts.seed : Date.now()) | 0;
-  for (let a = 0; a < 140; a++) { const G = tryGen(opts, base + a * 7919, a); if (G) return G; }
+  // ctx.scales — подогнанный под форму коэффициент размера: суша должна получиться ≈ CFG.mapTiles[size] клеток (не зависит от числа игроков).
+  // Попытки, не прошедшие только по размеру, в счёт «неудач» не идут — иначе рано включались бы запасные упрощения.
+  const ctx = { scales: {}, sizeBad: false };
+  let attempt = 0;
+  for (let tries = 0; tries < 320 && attempt < 140; tries++) {
+    const G = tryGen(opts, base + tries * 7919, attempt, ctx);
+    if (G) return G;
+    if (!ctx.sizeBad) attempt++;
+  }
   throw new Error('Не удалось сгенерировать карту');
+}
+const isFarm = b => b === 'farm' || b === 'farm2';
+const isSiege = G => G.opts.mode === 'siege';
+// убираем лишние береговые клетки, пока суши не станет ровно target; сушу не рвём (клетка снимается, только если её соседи-суша идут одной дугой)
+function trimLand(G, target) {
+  for (let guard = 0; G.tiles.size > target && guard < 4000; guard++) {
+    const cand = [];
+    let minLand = 7;
+    for (const t of G.tiles.values()) {
+      let land = 0, trans = 0, prev = G.tiles.has(key(t.q + DIRS[5][0], t.r + DIRS[5][1]));
+      for (let i = 0; i < 6; i++) { const l = G.tiles.has(key(t.q + DIRS[i][0], t.r + DIRS[i][1])); if (l) land++; if (l !== prev) trans++; prev = l; }
+      if (land >= 1 && land < 6 && trans === 2) { cand.push([t, land]); if (land < minLand) minLand = land; }
+    }
+    if (!cand.length) break;
+    const pool = cand.filter(c => c[1] <= Math.max(2, minLand));       // сначала самые «торчащие» клетки — берег остаётся ровным
+    const pick = pool[Math.floor(rnd(G) * pool.length)][0];
+    G.tiles.delete(key(pick.q, pick.r));
+  }
 }
 
 function components(G) {
@@ -145,8 +187,9 @@ function seaAround(G) {
   }
 }
 
-function tryGen(opts, seed, attempt) {
-  const duel = opts.mode === 'duel';
+function tryGen(opts, seed, attempt, ctx) {
+  const siege = opts.mode === 'siege';
+  const duel = opts.mode === 'duel' || siege;          // осадный режим — дуэль с пушками: общие правила найма, ферм и дипломатии
   const plist = duel && opts.players.length < 2 ? [0, 1].map(i => opts.players[i] || { ai: true }) : opts.players;
   const n = plist.length;
   const blitz = opts.mode === 'blitz';
@@ -155,23 +198,26 @@ function tryGen(opts, seed, attempt) {
     opts: {
       size: opts.size || 'medium', winMode: (blitz || duel) ? 'last' : (opts.winMode || 'last'), connectivity: !!opts.connectivity,
       allyWin: (blitz || duel) ? false : opts.allyWin !== false, turnSec: opts.turnSec | 0,
-      mode: blitz ? 'blitz' : duel ? 'duel' : 'classic', map: opts.map === 'continent' ? 'continent' : 'islands', diplomacy: duel ? (n > 2 && opts.diplomacy !== false) : opts.diplomacy !== false,
+      mode: blitz ? 'blitz' : siege ? 'siege' : duel ? 'duel' : 'classic', map: opts.map === 'continent' ? 'continent' : 'islands', diplomacy: duel ? (n > 2 && opts.diplomacy !== false) : opts.diplomacy !== false,
       fresh: duel, shape: 'hex'
     },
     maxRounds: blitz ? CFG.blitz.rounds : 0,
     nextId: 1, evId: 0, events: [], hist: [],
-    dipl: { rel: {}, props: [], cool: {}, nextProp: 1, fav: {}, alliances: [], nextAlly: 1 }
+    dipl: { rel: {}, props: [], cool: {}, nextProp: 1, fav: {}, alliances: [], nextAlly: 1, trade: [], debts: [], nextDebt: 1 }
   };
   let shape = opts.shape === 'random' ? SHAPES[Math.floor(rnd(G) * SHAPES.length)] : (SHAPES.indexOf(opts.shape) >= 0 ? opts.shape : 'hex');
   if (attempt >= 100) shape = 'hex';                // запасной вариант: форма не получилась — классический шестиугольник
   G.opts.shape = shape;
-  const R = ({ small: 5, medium: 7, large: 9 }[G.opts.size] || 7) + (n >= 5 ? 1 : 0) + (n >= 7 ? 2 : 0) + (n >= 9 ? 2 : 0);
+  if (!CFG.mapTiles[G.opts.size]) G.opts.size = 'medium';
+  const T = CFG.mapTiles[G.opts.size];
+  const sc0 = (ctx && ctx.scales[shape]) || 1;
+  const R = Math.max(2.5, Math.sqrt(T / 2.4) * sc0), Ri = Math.max(2, Math.round(R));
   const disc = [];
   if (shape === 'hex') {
-    for (let q = -R; q <= R; q++) for (let r = Math.max(-R, -q - R); r <= Math.min(R, -q + R); r++) {
+    for (let q = -Ri; q <= Ri; q++) for (let r = Math.max(-Ri, -q - Ri); r <= Math.min(Ri, -q + Ri); r++) {
       disc.push([q, r]);
       const dist = (Math.abs(q) + Math.abs(r) + Math.abs(q + r)) / 2;
-      if (dist >= R - 1 && rnd(G) < 0.3) continue;
+      if (dist >= Ri - 1 && rnd(G) < 0.3) continue;
       G.tiles.set(key(q, r), { q, r, owner: -1, tree: false, treeTimer: 0, building: null, unit: null, res: null });
     }
   } else {
@@ -191,7 +237,7 @@ function tryGen(opts, seed, attempt) {
   }
 
   if (G.opts.map === 'islands') {
-    const k = Math.max(2, Math.min(8, Math.round(n * 0.7) + 1));
+    const k = Math.max(2, Math.min(8, Math.round(n * 0.7) + 1, Math.floor(T / 25)));       // на маленькой карте островов меньше, чтобы им хватало суши
     const land = [...G.tiles.values()];
     const seeds = [land[Math.floor(rnd(G) * land.length)]];
     while (seeds.length < k) {
@@ -207,20 +253,34 @@ function tryGen(opts, seed, attempt) {
   }
   let comps = components(G);
   if (G.opts.map === 'continent') comps = comps.slice(0, 1);
-  comps = comps.filter(c => c.length >= 14);
+  const minIsl = T <= 60 ? 10 : 14;
+  comps = comps.filter(c => c.length >= minIsl);
+  G.tiles = new Map(comps.flat().map(t => [key(t.q, t.r), t]));
+  // размер карты: целимся в ~1.15·T клеток, потом точно ужимаем до T. Не вышло по размеру — подгоняем коэффициент формы и пробуем снова
+  const sz = G.tiles.size;
+  if (ctx) ctx.sizeBad = false;
+  if (sz < T || sz > T * 1.6) {
+    if (ctx) { ctx.sizeBad = true; ctx.scales[shape] = Math.max(0.45, Math.min(2.2, sc0 * Math.sqrt(1.15 * T / Math.max(sz, 6)))); }
+    return null;
+  }
+  trimLand(G, T);
+  comps = components(G);
+  if (G.opts.map === 'continent') comps = comps.slice(0, 1);
+  comps = comps.filter(c => c.length >= minIsl);
   G.tiles = new Map(comps.flat().map(t => [key(t.q, t.r), t]));
   const islands = comps;
-  if (!islands.length || G.tiles.size < n * (CFG.startTiles + 8)) return null;
+  const minPer = Math.max(3, Math.min(CFG.minLandPer, Math.floor(T / n * 0.6)));
+  if (!islands.length || G.tiles.size < n * minPer) return null;
   if (shape === 'hex') { for (const [q, r] of disc) if (!G.tiles.has(key(q, r))) G.sea.set(key(q, r), { q, r, sea: true, ship: null }); }
   else seaAround(G);
 
   G.players = plist.map((p, i) => ({
     id: i, name: String(p.name || (p.ai ? botName(i) : humanName(i))).slice(0, 20), ai: p.ai ? 'hard' : null,
-    color: i, money: blitz ? CFG.blitz.money : CFG.startMoney, alive: true, tiles: 0, betrayals: 0
+    color: i, money: blitz ? CFG.blitz.money : CFG.startMoney, alive: true, tiles: 0, betrayals: 0, lost: 0
   }));
 
   // распределяем игроков по островам (больше остров — больше игроков)
-  const need = CFG.startTiles + 10;
+  const need = Math.max(3, Math.min(CFG.startNeed, Math.floor(0.7 * G.tiles.size / n)));      // сколько суши «нужно» игроку: на тесной карте с ботами — меньше
   const cap = islands.map(isl => Math.floor(isl.length / need)), used = islands.map(() => 0), assign = [];
   for (let p = 0; p < n; p++) {
     let bi = -1, bv = 0;
@@ -228,9 +288,9 @@ function tryGen(opts, seed, attempt) {
     if (bi < 0) return null;
     used[bi]++; assign.push(bi);
   }
-  const minD = attempt < 30 ? 5 : 4;
   for (let i = 0; i < islands.length; i++) {
     const ps = assign.map((a, p) => a === i ? p : -1).filter(p => p >= 0), chosen = [];
+    const minD = Math.max(2, Math.min(5, Math.floor(Math.sqrt(islands[i].length / Math.max(1, ps.length)) * 0.9)) - (attempt >= 60 ? 1 : 0));
     for (const p of ps) {
       let best = null, bd = -1;
       for (const t of islands[i]) {
@@ -270,7 +330,7 @@ function recordHist(G) {
   G.hist.push({ r: G.round, p: G.players.map(p => {
     if (!p.alive) return null;
     const e = econ(G, p.id);
-    return { tiles: e.tiles, income: e.income, net: e.net, money: p.money, farms: e.farms, units: e.units, power: strength(G, p.id) };
+    return { tiles: e.tiles, income: e.income, net: e.net, money: p.money, farms: e.farms, units: e.units, power: strength(G, p.id), lost: p.lost | 0 };
   }) });
   if (G.hist.length > 400) G.hist.shift();
 }
@@ -279,8 +339,9 @@ function recordHist(G) {
 // море [q,r] или [q,r,ship], ship=[id,owner,moved,cargo|0], cargo=[id,type,owner,moved]
 function serialize(G) {
   const o = Object.assign({}, G);
+  o.undoN = G._undo ? G._undo.length : 0;
   o.tiles = [...G.tiles.values()].map(t => [t.q, t.r, t.owner, t.tree ? 1 : 0, t.treeTimer, t.building,
-    t.unit ? [t.unit.id, t.unit.type, t.unit.owner, t.unit.moved ? 1 : 0, t.unit.fresh ? 1 : 0, t.unit.born | 0] : null, t.res ? [t.res.kind, t.res.left] : null]);
+    t.unit ? [t.unit.id, t.unit.type, t.unit.owner, t.unit.moved ? 1 : 0, t.unit.fresh ? 1 : 0, t.unit.born | 0] : null, t.res ? [t.res.kind, t.res.left] : null, t.f | 0]);
   o.sea = [...G.sea.values()].map(s => !s.ship ? [s.q, s.r] : [s.q, s.r, [s.ship.id, s.ship.owner, s.ship.moved ? 1 : 0,
     s.ship.cargo ? [s.ship.cargo.id, s.ship.cargo.type, s.ship.cargo.owner, s.ship.cargo.moved ? 1 : 0, s.ship.cargo.born | 0] : 0]]);
   return o;
@@ -288,10 +349,11 @@ function serialize(G) {
 function deserialize(o) {
   const G = Object.assign({}, o);
   G.tiles = new Map(o.tiles.map(a => [key(a[0], a[1]), { q: a[0], r: a[1], owner: a[2], tree: !!a[3], treeTimer: a[4], building: a[5],
-    unit: a[6] ? { id: a[6][0], type: a[6][1], owner: a[6][2], moved: !!a[6][3], fresh: !!a[6][4], born: a[6][5] === undefined ? -99 : a[6][5] } : null, res: a[7] ? { kind: a[7][0], left: a[7][1] } : null }]));
+    unit: a[6] ? { id: a[6][0], type: a[6][1], owner: a[6][2], moved: !!a[6][3], fresh: !!a[6][4], born: a[6][5] === undefined ? -99 : a[6][5] } : null, res: a[7] ? { kind: a[7][0], left: a[7][1] } : null, f: a[8] | 0 }]));
   G.sea = new Map(o.sea.map(a => [key(a[0], a[1]), { q: a[0], r: a[1], sea: true, ship: a[2] ? { id: a[2][0], owner: a[2][1], moved: !!a[2][2],
     cargo: a[2][3] ? { id: a[2][3][0], type: a[2][3][1], owner: a[2][3][2], moved: !!a[2][3][3], born: a[2][3][4] === undefined ? -99 : a[2][3][4] } : null } : null }]));
   if (!G.hist) G.hist = [];
+  G.undoN = o.undoN | 0;
   migrateAlliances(G);
   return G;
 }
@@ -311,31 +373,33 @@ function tileDef(G, t) {
   return best;
 }
 
-function econ(G, pid) {
+function econ(G, pid, part) {
   let land = 0, farmInc = 0, resInc = 0, upU = 0, upB = 0, farms = 0, towers = 0, tiles = 0, units = 0, ships = 0, res = 0;
   for (const t of G.tiles.values()) {
-    if (t.owner !== pid) continue;
+    if (t.owner !== pid || (part !== undefined && (t.f | 0) !== part)) continue;
     tiles++; land += t.tree ? CFG.treeIncome : CFG.landIncome;
     if (t.res) { res++; resInc += CFG.res[t.res.kind].income; }
-    if (t.building) { const b = CFG.buildings[t.building]; farmInc += b.income; upB += b.upkeep; if (t.building === 'farm') farms++; else towers++; }
+    if (t.building) { const b = CFG.buildings[t.building]; farmInc += b.income; upB += b.upkeep; if (isFarm(t.building)) farms++; else towers++; }
     if (t.unit) { upU += CFG.units[t.unit.type].upkeep; units++; }
   }
-  for (const s of G.sea.values()) {
+  for (const s of (part ? [] : G.sea.values())) {
     if (!s.ship || s.ship.owner !== pid) continue;
     ships++; upU += CFG.ship.upkeep;
     if (s.ship.cargo) { upU += CFG.units[s.ship.cargo.type].upkeep; units++; }
   }
-  const income = land + farmInc + resInc;
-  return { land, farmInc, resInc, upkeep: upU + upB, income, net: income - upU - upB, tiles, farms, towers, units, ships, res };
+  const trade = part ? 0 : tradePartners(G, pid).length * CFG.diplo.tradeIncome;
+  const income = land + farmInc + resInc + trade;
+  return { land, farmInc, resInc, trade, upkeep: upU + upB, income, net: income - upU - upB, tiles, farms, towers, units, ships, res };
 }
 function farmCost(G, pid) { const b = CFG.buildings.farm; return b.cost + (G.opts.fresh ? CFG.duel.farmStep : b.costStep) * econ(G, pid).farms; }
 // можно ли поставить ферму на клетку t (дуэль: рядом с другой своей фермой, если ферма уже есть)
 function farmSpotOk(G, pid, t) {
   if (!G.opts.fresh) return true;
   if (econ(G, pid).farms === 0) return true;
-  return nbrs(G, t).some(n => n.owner === pid && n.building === 'farm');
+  return nbrs(G, t).some(n => n.owner === pid && isFarm(n.building));
 }
 function buildCost(G, pid, kind) { return kind === 'farm' ? farmCost(G, pid) : CFG.buildings[kind].cost; }
+function cannonCount(G, pid) { let n = 0; for (const t of G.tiles.values()) if (t.owner === pid && t.unit && CFG.units[t.unit.type].cannon) n++; return n; }
 
 function strength(G, pid) {
   const e = econ(G, pid); let lv = 0;
@@ -360,11 +424,36 @@ function relSince(G, a, b) { const r = G.dipl.rel[pairKey(a, b)]; return r ? r.s
 // Срочная дружба по истечении превращается в войну, срочная война — в мир. Любая война помнит, когда началась (минимум minWarRounds ходов).
 function setRel(G, a, b, lvl, turns) {
   G.dipl.rel[pairKey(a, b)] = { lvl, since: G.round, until: turns ? G.round + turns : 0 };
+  if (lvl === 'war') dropTrade(G, a, b);                 // война разрывает торговлю
+}
+// ---- торговые договоры: оба государства получают +tradeIncome монет в ход, пока нет войны ----
+function tradePartners(G, pid) {
+  const out = [], l = G.dipl && G.dipl.trade; if (!l) return out;
+  for (const t of l) { const o = t.a === pid ? t.b : t.b === pid ? t.a : -1; if (o >= 0 && G.players[o] && G.players[o].alive && relOf(G, pid, o) !== 'war') out.push(o); }
+  return out;
+}
+const hasTrade = (G, a, b) => G.dipl.trade.some(t => (t.a === a && t.b === b) || (t.a === b && t.b === a));
+function dropTrade(G, a, b) { G.dipl.trade = G.dipl.trade.filter(t => !((t.a === a && t.b === b) || (t.a === b && t.b === a))); }
+const tradeCount = (G, pid) => G.dipl.trade.filter(t => t.a === pid || t.b === pid).length;
+// ---- долги: заёмщик отдаёт по части каждый свой ход ----
+const debtBetween = (G, lender, borrower) => G.dipl.debts.find(d => d.from === lender && d.to === borrower);
+function payDebts(G, pid) {
+  for (const d of G.dipl.debts.slice()) {
+    if (d.to !== pid) continue;
+    const B = G.players[pid], L = G.players[d.from];
+    if (!L.alive) { G.dipl.debts.splice(G.dipl.debts.indexOf(d), 1); continue; }
+    const due = Math.min(d.per, d.left), pay = Math.min(due, Math.max(0, B.money));
+    B.money -= pay; L.money += pay; d.left -= pay;
+    if (pay < due) { addFav(G, d.from, pid, -1); ev(G, '🏦 ' + B.name + ' не смог выплатить долг полностью: ' + L.name + ' (осталось ' + d.left + ')'); }
+    if (d.left <= 0) { G.dipl.debts.splice(G.dipl.debts.indexOf(d), 1); ev(G, '🏦 ' + B.name + ' вернул долг: ' + L.name); addFav(G, d.from, pid, 1); }
+  }
 }
 function relUntil(G, a, b) { const r = G.dipl.rel[pairKey(a, b)]; return r && r.until && r.lvl !== 'alliance' ? r.until : 0; }
 // старые сохранения: попарные союзы превращаем в союзы-группы; основатель — государство с наименьшим номером
 function migrateAlliances(G) {
   if (!G.dipl) G.dipl = { rel: {}, props: [], cool: {}, nextProp: 1, fav: {} };
+  if (!G.dipl.trade) G.dipl.trade = [];
+  if (!G.dipl.debts) { G.dipl.debts = []; G.dipl.nextDebt = 1; }
   if (G.dipl.alliances) return;
   G.dipl.alliances = []; G.dipl.nextAlly = 1;
   const par = {}, f = x => { if (par[x] === undefined) par[x] = x; return par[x] === x ? x : (par[x] = f(par[x])); };
@@ -385,10 +474,25 @@ function dropFromAlliance(G, pid) {
     if (al.members.length < 2) l.splice(l.indexOf(al), 1);
   }
 }
-// Связан ли a союзом в войне с b: a — не основатель, а основатель его союза воюет с b. Тогда a не может заключить мир с b, пока не выйдет из союза.
-function allyBound(G, a, b) {
-  const al = allianceOf(G, a); if (!al || al.founder === a || al.members.indexOf(b) >= 0) return false;
-  return relOf(G, al.founder, b) === 'war' && relOf(G, a, b) === 'war';
+// Война по обязательству: a вступил в войну с b, потому что на союзника v напали (rel.aid = v).
+// Пока v сам воюет с b, a не может заключить с b отдельный мир (кроме выхода из союза). Когда v мирится с b, все такие войны заканчиваются сами.
+function aidVictim(G, a, b) {
+  const r = G.dipl.rel[pairKey(a, b)]; if (!r || r.lvl !== 'war' || r.aid === undefined || r.aid === null) return -1;
+  const al = allianceOf(G, a), v = r.aid;
+  if (!al || v === a || al.members.indexOf(v) < 0 || !G.players[v].alive || al.members.indexOf(b) >= 0) return -1;
+  return relOf(G, v, b) === 'war' ? v : -1;
+}
+function allyBound(G, a, b) { return aidVictim(G, a, b) >= 0; }
+// victim заключил мир с attacker: союзники, вступившие в эту войну ради него, тоже прекращают её
+function endAidWars(G, victim, attacker) {
+  const al = allianceOf(G, victim); if (!al) return;
+  for (const m of al.members) {
+    if (m === victim || !G.players[m].alive) continue;
+    const r = G.dipl.rel[pairKey(m, attacker)];
+    if (!r || r.lvl !== 'war' || r.aid !== victim) continue;
+    G.dipl.rel[pairKey(m, attacker)] = { lvl: 'peace', since: G.round, until: 0 }; dropProps(G, m, attacker);
+    ev(G, '🕊 ' + G.players[m].name + ' прекращает войну с ' + G.players[attacker].name + ': союзник ' + G.players[victim].name + ' заключил мир');
+  }
 }
 // сколько ещё ходов нельзя закончить войну (минимум 2 хода после объявления; срочная война — до конца срока)
 function warLockLeft(G, a, b) {
@@ -398,8 +502,8 @@ function warLockLeft(G, a, b) {
 function peaceBlock(G, a, b) {
   const wl = warLockLeft(G, a, b);
   if (wl > 0) return 'Войну нельзя закончить ещё ' + wl + ' ход.';
-  if (allyBound(G, a, b)) return pname(G, a) + ' связан союзом: мир возможен, когда основатель союза (' + pname(G, allianceOf(G, a).founder) + ') закончит эту войну, либо при выходе из союза';
-  if (allyBound(G, b, a)) return pname(G, b) + ' связан союзом: мир возможен, когда основатель его союза (' + pname(G, allianceOf(G, b).founder) + ') закончит эту войну';
+  if (allyBound(G, a, b)) return pname(G, a) + ' воюет за союзника: мир возможен, когда ' + pname(G, aidVictim(G, a, b)) + ' закончит эту войну, либо при выходе из союза';
+  if (allyBound(G, b, a)) return pname(G, b) + ' воюет за союзника: мир возможен, когда ' + pname(G, aidVictim(G, b, a)) + ' закончит эту войну';
   return '';
 }
 function termLeft(G, a, b) { const u = relUntil(G, a, b); return u ? Math.max(0, u - G.round) : 0; }
@@ -426,7 +530,7 @@ const hasProp = (G, from, to, kind) => G.dipl.props.some(p => p.from === from &&
 const onCooldown = (G, from, to) => (G.dipl.cool[from + '>' + to] || 0) > G.round;
 function amountOk(G, amount, max) { return isInt(amount) && amount >= 1 && amount <= Math.min(CFG.diplo.maxMoney, max === undefined ? CFG.diplo.maxMoney : max); }
 
-function actPropose(G, pid, to, level, turns) {
+function actPropose(G, pid, to, level, turns, pay, mode) {
   const g = dipGuard(G, pid, to); if (g) return g;
   if (level !== 'peace' && level !== 'alliance') return fail('Неизвестное предложение');
   if (level === 'alliance') turns = 0;                  // союз бессрочный: из него выходят сами
@@ -436,18 +540,28 @@ function actPropose(G, pid, to, level, turns) {
   if (level === 'alliance') {
     if (cur === 'alliance') return fail('Вы уже в одном союзе');
     if (cur === 'war') return fail('Сначала заключите дружбу');
-    const plan = joinPlan(G, pid, to); if (plan.err) return fail(plan.err);
+    const plan = mode === 'switch' ? switchPlan(G, pid, to) : joinPlan(G, pid, to); if (plan.err) return fail(plan.err);
   } else {
     if (!treatyUseful(G, pid, to, level)) return fail('Это уже действует');
     if (cur === 'war') { const b = peaceBlock(G, pid, to); if (b) return fail(b); }
   }
+  pay = pay | 0;
+  if (pay < 0 || (pay > 0 && (level !== 'peace' || cur !== 'war' || !amountOk(G, pay, G.players[pid].money)))) return fail('Недопустимая сумма');
   if (hasProp(G, pid, to, 'treaty')) return fail('Предложение уже отправлено');
   if (onCooldown(G, pid, to)) return fail('Недавно отклонено — подождите');
-  G.dipl.props.push({ id: G.dipl.nextProp++, kind: 'treaty', from: pid, to, level, turns, round: G.round });
-  ev(G, pname(G, pid) + ' предлагает ' + LVL_RU[level] + termTxt(turns) + ' → ' + pname(G, to));
+  G.dipl.props.push({ id: G.dipl.nextProp++, kind: 'treaty', from: pid, to, level, turns, pay, round: G.round, mode: level === 'alliance' && mode === 'switch' ? 'switch' : undefined });
+  ev(G, pname(G, pid) + (mode === 'switch' && level === 'alliance' ? ' зовёт в свой союз (из прежнего) ' : ' предлагает ') + LVL_RU[level] + termTxt(turns) + (pay ? ' и платит ' + pay + ' монет' : '') + ' → ' + pname(G, to));
   return ok('Предложение отправлено');
 }
 
+// «Перекупить союзника»: to выходит из своего союза и вступает в союз from (или создаёт новый с from). Решает сам to — принять или остаться.
+function switchPlan(G, from, to) {
+  const B = allianceOf(G, to), A = allianceOf(G, from);
+  if (!B) return { err: 'Это государство не состоит в союзе' };
+  if (A && A === B) return { err: 'Вы уже в одном союзе' };
+  if (A) for (const m of A.members) if (relOf(G, to, m) === 'war') return { err: 'Есть война с участником союза: ' + pname(G, m) + ' — сначала заключите мир' };
+  return { A, B };
+}
 // кто в чей союз вступает при принятии предложения from → to
 function joinPlan(G, from, to) {
   const A = allianceOf(G, from), B = allianceOf(G, to);
@@ -458,11 +572,11 @@ function joinPlan(G, from, to) {
   return { al, joiner };
 }
 // нападение на члена союза: все остальные члены вступают в войну с агрессором
-function callToArms(G, attacker, victim, turns) {
+function callToArms(G, attacker, victim) {
   const al = allianceOf(G, victim); if (!al) return;
   for (const m of al.members.slice()) {
     if (m === victim || m === attacker || !G.players[m].alive || relOf(G, m, attacker) === 'war') continue;
-    setRel(G, m, attacker, 'war', turns); dropProps(G, m, attacker);
+    setRel(G, m, attacker, 'war', 0); G.dipl.rel[pairKey(m, attacker)].aid = victim; dropProps(G, m, attacker);
     addFav(G, attacker, m, -2);
     ev(G, '🤝⚔ ' + pname(G, m) + ' вступает в войну против ' + pname(G, attacker) + ': союзник ' + pname(G, victim) + ' подвергся нападению');
   }
@@ -477,7 +591,7 @@ function actWar(G, pid, to, turns) {
   if (was === 'war') {                                       // уже воюем: можно назначить срок («война на N ходов, затем мир»)
     if (!turns) return fail('Вы уже воюете');
     const prev = G.dipl.rel[pairKey(pid, to)], since = prev ? prev.since : 0;
-    setRel(G, pid, to, 'war', turns); G.dipl.rel[pairKey(pid, to)].since = since; dropProps(G, pid, to);
+    setRel(G, pid, to, 'war', turns); G.dipl.rel[pairKey(pid, to)].since = since; dropProps(G, pid, to);       // прямая война: обязательство перед союзником снимается
     ev(G, '⚔ ' + pname(G, pid) + ' и ' + pname(G, to) + ': война' + termTxt(turns) + ', затем мир');
     return ok('Срок войны назначен');
   }
@@ -486,7 +600,8 @@ function actWar(G, pid, to, turns) {
   setRel(G, pid, to, 'war', turns); dropProps(G, pid, to);
   G.players[pid].betrayals += 1; addFav(G, to, pid, -4);
   ev(G, '⚔ ' + pname(G, pid) + ' объявил войну: ' + pname(G, to) + termTxt(turns) + ' (мин. ' + CFG.diplo.minWarRounds + ' хода)');
-  callToArms(G, pid, to, turns);
+  noteAttack(G, pid, to, '');
+  callToArms(G, pid, to);
   updateStatus(G);
   return ok('Война объявлена');
 }
@@ -559,6 +674,21 @@ function actRespond(G, pid, id, accept) {
   if (pr.kind === 'treaty') {
     if (pr.level === 'alliance') {
       if (relOf(G, pid, from) === 'alliance' || relOf(G, pid, from) === 'war') { dropProps(G, pid, from); return fail('Предложение устарело'); }
+      if (pr.mode === 'switch') {
+        const sp = switchPlan(G, from, pid); if (sp.err) { drop(); return fail(sp.err); }
+        dropProps(G, pid, from);
+        const bound = G.players.some(e => e.alive && e.id !== pid && sp.B.members.indexOf(e.id) < 0 && allyBound(G, pid, e.id));
+        const mates = sp.B.members.filter(m => m !== pid);
+        dropFromAlliance(G, pid);
+        for (const m of mates) { setRel(G, pid, m, 'peace', 0); dropProps(G, pid, m); addFav(G, m, pid, bound ? -3 : -1.5); }
+        if (bound) G.players[pid].betrayals += 1;
+        const A2 = allianceOf(G, from);
+        if (A2) A2.members.push(pid); else G.dipl.alliances.push({ id: G.dipl.nextAlly++, founder: from, members: [from, pid] });
+        ev(G, '🔀 ' + pname(G, pid) + ' покинул прежний союз и вступил в союз с ' + pname(G, from));
+        addFav(G, pid, from, 1.5); addFav(G, from, pid, 1.5);
+        updateStatus(G);
+        return ok('Принято');
+      }
       const plan = joinPlan(G, from, pid); if (plan.err) { drop(); return fail(plan.err); }
       dropProps(G, pid, from);
       if (plan.fresh) { G.dipl.alliances.push({ id: G.dipl.nextAlly++, founder: from, members: [from, pid] }); ev(G, '🤝 ' + pname(G, from) + ' и ' + pname(G, pid) + ' создали союз'); }
@@ -569,9 +699,12 @@ function actRespond(G, pid, id, accept) {
     }
     if (!treatyUseful(G, pid, from, pr.level)) { dropProps(G, pid, from); return fail('Предложение устарело'); }
     if (relOf(G, pid, from) === 'war') { const b = peaceBlock(G, pid, from); if (b) { drop(); return fail(b); } }
+    const wasWar = relOf(G, pid, from) === 'war';
     setRel(G, pid, from, pr.level, pr.turns | 0); dropProps(G, pid, from);
+    if (pr.pay > 0 && G.players[from].money >= pr.pay) { G.players[from].money -= pr.pay; G.players[pid].money += pr.pay; addFav(G, pid, from, Math.min(3, pr.pay / 15)); }
     addFav(G, pid, from, 1); addFav(G, from, pid, 1);
-    ev(G, pname(G, pid) + ' и ' + pname(G, from) + ': дружба 🕊️' + termTxt(pr.turns | 0));
+    ev(G, pname(G, pid) + ' и ' + pname(G, from) + ': дружба 🕊️' + termTxt(pr.turns | 0) + (pr.pay > 0 ? ' (выкуп ' + pr.pay + ' монет)' : ''));
+    if (wasWar) { endAidWars(G, pid, from); endAidWars(G, from, pid); }
     updateStatus(G);
     return ok('Принято');
   }
@@ -592,11 +725,134 @@ function actRespond(G, pid, id, accept) {
     setRel(G, pid, t, 'war'); dropProps(G, pid, t); drop();
     addFav(G, from, pid, 2); addFav(G, t, pid, -3);
     ev(G, '⚔ ' + pname(G, pid) + ' объявил войну ' + pname(G, t) + ' по заказу ' + pname(G, from) + ' (' + pr.amount + ' монет)');
-    callToArms(G, pid, t, 0);
+    callToArms(G, pid, t);
+    updateStatus(G);
+    return ok('Война объявлена');
+  }
+  if (pr.kind === 'trade') {
+    if (relOf(G, pid, from) === 'war') { drop(); return fail('Предложение устарело'); }
+    if (hasTrade(G, pid, from) || tradeCount(G, pid) >= CFG.diplo.tradeMax || tradeCount(G, from) >= CFG.diplo.tradeMax) { drop(); return fail('Торговый договор невозможен'); }
+    G.dipl.trade.push({ a: from, b: pid, since: G.round }); drop();
+    addFav(G, pid, from, 1); addFav(G, from, pid, 1);
+    ev(G, '📦 ' + pname(G, pid) + ' и ' + pname(G, from) + ': торговый договор (+' + CFG.diplo.tradeIncome + ' монет в ход каждому)');
+    return ok('Принято');
+  }
+  if (pr.kind === 'loan' || pr.kind === 'borrow') {
+    const lender = pr.kind === 'loan' ? from : pid, borrower = pr.kind === 'loan' ? pid : from;
+    if (relOf(G, pid, from) === 'war' || debtBetween(G, lender, borrower)) { drop(); return fail('Предложение устарело'); }
+    if (G.players[lender].money < pr.amount) { drop(); return fail('У кредитора не хватает монет'); }
+    drop(); openLoan(G, lender, borrower, pr.amount);
+    return ok('Займ выдан');
+  }
+  if (pr.kind === 'help') {
+    const t = pr.target;
+    if (!G.players[t].alive || relOf(G, pid, t) === 'war' || relOf(G, from, t) !== 'war') { drop(); return fail('Предложение устарело'); }
+    if (relOf(G, pid, t) === 'alliance') { drop(); return fail('Нельзя воевать с союзником — сначала выйдите из союза'); }
+    if (lockLeft(G, pid, t) > 0) { drop(); return fail('Договор с целью ещё нельзя разорвать'); }
+    setRel(G, pid, t, 'war'); dropProps(G, pid, t); drop();
+    addFav(G, from, pid, 2); addFav(G, t, pid, -3);
+    ev(G, '⚔ ' + pname(G, pid) + ' объявил войну ' + pname(G, t) + ' по просьбе ' + pname(G, from));
+    callToArms(G, pid, t);
     updateStatus(G);
     return ok('Война объявлена');
   }
   drop(); return fail('Неизвестное предложение');
+}
+
+// ---- торговля, займы, просьбы о помощи, управление союзом ----
+function actTrade(G, pid, to) {
+  const g = dipGuard(G, pid, to); if (g) return g;
+  if (relOf(G, pid, to) === 'war') return fail('С врагом торговать нельзя');
+  if (hasTrade(G, pid, to)) return fail('Торговый договор уже действует');
+  if (tradeCount(G, pid) >= CFG.diplo.tradeMax || tradeCount(G, to) >= CFG.diplo.tradeMax) return fail('Не больше ' + CFG.diplo.tradeMax + ' торговых договоров у государства');
+  if (hasProp(G, pid, to, 'trade')) return fail('Предложение уже отправлено');
+  if (onCooldown(G, pid, to)) return fail('Недавно отклонено — подождите');
+  G.dipl.props.push({ id: G.dipl.nextProp++, kind: 'trade', from: pid, to, round: G.round });
+  ev(G, pname(G, pid) + ' предлагает торговый договор → ' + pname(G, to));
+  return ok('Предложение отправлено');
+}
+function actCancelTrade(G, pid, to) {
+  const g = dipGuard(G, pid, to); if (g) return g;
+  if (!hasTrade(G, pid, to)) return fail('Торгового договора нет');
+  dropTrade(G, pid, to); addFav(G, to, pid, -0.5); G.dipl.cool[pid + '>' + to] = G.round + 3;
+  ev(G, '📦 ' + pname(G, pid) + ' расторг торговый договор с ' + pname(G, to));
+  return ok('Договор расторгнут');
+}
+// займ: kind 'loan' — pid даёт в долг, 'borrow' — pid просит в долг
+function actLoan(G, pid, to, amount, kind) {
+  const g = dipGuard(G, pid, to); if (g) return g;
+  const lender = kind === 'loan' ? pid : to, borrower = kind === 'loan' ? to : pid;
+  if (!amountOk(G, amount, kind === 'loan' ? G.players[pid].money : undefined)) return fail('Недопустимая сумма');
+  if (relOf(G, pid, to) === 'war') return fail('Во время войны в долг не дают');
+  if (debtBetween(G, lender, borrower)) return fail('Прошлый долг ещё не возвращён');
+  if (hasProp(G, pid, to, kind)) return fail('Предложение уже отправлено');
+  if (onCooldown(G, pid, to)) return fail('Недавно отклонено — подождите');
+  G.dipl.props.push({ id: G.dipl.nextProp++, kind, from: pid, to, amount, round: G.round });
+  ev(G, kind === 'loan' ? pname(G, pid) + ' предлагает ' + pname(G, to) + ' займ ' + amount + ' монет' : pname(G, pid) + ' просит у ' + pname(G, to) + ' в долг ' + amount + ' монет');
+  return ok('Предложение отправлено');
+}
+function openLoan(G, lender, borrower, amount) {
+  const total = Math.ceil(amount * (1 + CFG.diplo.loanRate));
+  G.players[lender].money -= amount; G.players[borrower].money += amount;
+  G.dipl.debts.push({ id: G.dipl.nextDebt++, from: lender, to: borrower, left: total, per: Math.ceil(total / CFG.diplo.loanTurns) });
+  addFav(G, lender, borrower, 0.5); addFav(G, borrower, lender, 1);
+  ev(G, '🏦 ' + pname(G, lender) + ' дал в долг ' + pname(G, borrower) + ' ' + amount + ' монет (вернуть ' + total + ')');
+}
+// просьба о помощи: pid просит `to` объявить войну `target` (бесплатно)
+function actHelp(G, pid, to, target) {
+  const g = dipGuard(G, pid, to); if (g) return g;
+  if (!isInt(target) || target < 0 || target >= G.players.length || target === pid || target === to || !G.players[target].alive) return fail('Нет такой цели');
+  if (relOf(G, pid, to) === 'war') return fail('Сначала заключите мир');
+  if (relOf(G, pid, target) !== 'war') return fail('Просить о помощи можно в войне, которую вы уже ведёте');
+  if (relOf(G, to, target) === 'war') return fail('Они и так воюют');
+  if (relOf(G, to, target) === 'alliance') return fail('Они союзники — воевать друг с другом не могут');
+  if (lockLeft(G, to, target) > 0) return fail('Они недавно заключили договор — рано');
+  if (hasProp(G, pid, to, 'help')) return fail('Просьба уже отправлена');
+  if (onCooldown(G, pid, to)) return fail('Недавно отклонено — подождите');
+  G.dipl.props.push({ id: G.dipl.nextProp++, kind: 'help', from: pid, to, target, round: G.round });
+  ev(G, pname(G, pid) + ' просит ' + pname(G, to) + ' помочь в войне с ' + pname(G, target));
+  return ok('Просьба отправлена');
+}
+// управление союзом: основатель исключает участника или распускает союз
+function actKick(G, pid, target) {
+  const g = guard(G, pid); if (g) return g;
+  if (!G.opts.diplomacy) return fail('Дипломатия отключена в этой партии');
+  const al = allianceOf(G, pid); if (!al || al.founder !== pid) return fail('Только основатель союза может исключать');
+  if (target === pid || al.members.indexOf(target) < 0) return fail('Этого государства нет в вашем союзе');
+  dropFromAlliance(G, target);
+  setRel(G, pid, target, 'peace', 0); dropProps(G, pid, target);
+  for (const m of al.members) if (m !== target && G.players[m] && m !== pid) { setRel(G, m, target, 'peace', 0); }
+  addFav(G, target, pid, -2); G.dipl.cool[pid + '>' + target] = G.round + 4; G.dipl.cool[target + '>' + pid] = G.round + 4;
+  ev(G, '🚪 ' + pname(G, pid) + ' исключил из союза: ' + pname(G, target));
+  updateStatus(G);
+  return ok('Участник исключён');
+}
+function actDissolve(G, pid) {
+  const g = guard(G, pid); if (g) return g;
+  if (!G.opts.diplomacy) return fail('Дипломатия отключена в этой партии');
+  const al = allianceOf(G, pid); if (!al || al.founder !== pid) return fail('Только основатель союза может его распустить');
+  const ms = al.members.slice();
+  G.dipl.alliances.splice(G.dipl.alliances.indexOf(al), 1);
+  for (let i = 0; i < ms.length; i++) for (let j = i + 1; j < ms.length; j++) { setRel(G, ms[i], ms[j], 'peace', 0); dropProps(G, ms[i], ms[j]); }
+  ev(G, '🚪 ' + pname(G, pid) + ' распустил союз');
+  updateStatus(G);
+  return ok('Союз распущен');
+}
+
+// ---- отмена действия: снимки состояния только для людей, стек живёт до конца хода ----
+const UNDOABLE = { move: 1, buy: 1, build: 1, ship: 1, disband: 1, upgrade: 1, fire: 1 };
+function undoStack(G) { if (!G._undo) Object.defineProperty(G, '_undo', { value: [], writable: true, enumerable: false }); return G._undo; }
+function undoSnap(G) { const o = serialize(G); o.hist = []; o.events = []; return JSON.stringify(o); }     // глубокая копия: живое состояние потом меняется
+function undoClear(G) { if (G._undo && G._undo.length) G._undo.length = 0; }
+function actUndo(G, pid) {
+  const g = guard(G, pid); if (g) return g;
+  const st = G._undo; if (!st || !st.length) return fail('Нечего отменять');
+  const back = deserialize(JSON.parse(st.pop()));
+  const keep = { events: G.events, evId: G.evId, hist: G.hist, _undo: G._undo };
+  for (const k of Object.keys(back)) G[k] = back[k];
+  G.events = keep.events; G.evId = keep.evId; G.hist = keep.hist;
+  G.undoN = st.length;
+  return ok('Действие отменено', { kind: 'undo' });
 }
 
 // ---- 40-actions.js ----
@@ -606,6 +862,7 @@ function getMoves(G, from, unit) {
   unit = unit || from.unit;
   const p = unit.owner, U = CFG.units[unit.type];
   const res = new Map(), dist = new Map([[from, 0]]), queue = [from];
+  if (U.cannon) return res;                              // пушка не двигается
   for (let i = 0; i < queue.length; i++) {
     const c = queue[i], d = dist.get(c);
     if (d >= CFG.moveRange) continue;
@@ -657,9 +914,12 @@ function guard(G, pid) {
 
 function takeTile(G, pid, to, unit) {
   const old = to.owner;
-  to.owner = pid; to.building = null; to.tree = false; to.treeTimer = 0;
+  if (old >= 0 && old !== pid) noteAttack(G, pid, old, key(to.q, to.r));
+  if (to.unit && to.unit.owner !== pid) addLost(G, to.unit.owner, 1);           // защитник погиб
+  to.owner = pid; to.building = null; to.tree = false; to.treeTimer = 0; to.f = 0;
   to.unit = unit;
-  if (old >= 0 && G.opts.connectivity) cutOff(G, old);
+  if (old >= 0) { if (G.opts.connectivity) cutOff(G, old); else relabel(G, old); }
+  if (!G.opts.connectivity) relabel(G, pid);
   updateStatus(G);
 }
 
@@ -688,7 +948,7 @@ function actMove(G, pid, fk, tk) {
     }
     const u = { id: sh.cargo.id, type: sh.cargo.type, owner: pid, moved: true, born: sh.cargo.born | 0 };
     sh.cargo = null;
-    if (kind === 'move') { to.unit = u; return ok('Высадка', { kind }); }
+    if (kind === 'move') { to.unit = u; if (to.tree) { to.tree = false; to.treeTimer = 0; } return ok('Высадка', { kind }); }
     takeTile(G, pid, to, u);
     return ok(kind === 'attack' ? 'Клетка захвачена с моря' : 'Земля занята с моря', { kind });
   }
@@ -696,6 +956,7 @@ function actMove(G, pid, fk, tk) {
   if (!from.unit) return fail('Здесь нет войска');
   const u = from.unit;
   if (u.owner !== pid) return fail('Это чужое войско');
+  if (CFG.units[u.type].cannon) return fail('Пушка не двигается — она только стреляет');
   if (u.fresh) return fail('Войско только что нанято — оно сможет ходить со следующего хода');
   if (u.moved) return fail('Это войско уже действовало в этом ходу');
   const kind = getMoves(G, from).get(to);
@@ -708,7 +969,7 @@ function actMove(G, pid, fk, tk) {
     return fail('Туда нельзя дойти');
   }
   if (kind === 'board') { to.ship.cargo = { id: u.id, type: u.type, owner: pid, moved: true, born: u.born | 0 }; from.unit = null; return ok('Солдат на борту', { kind }); }
-  if (kind === 'move') { to.unit = u; from.unit = null; u.moved = true; return ok('Перемещение', { kind }); }
+  if (kind === 'move') { to.unit = u; from.unit = null; u.moved = true; if (to.tree) { to.tree = false; to.treeTimer = 0; return ok('Дерево расчищено', { kind }); } return ok('Перемещение', { kind }); }
   if (kind === 'merge') {
     const other = to.unit;
     from.unit = null;
@@ -730,29 +991,114 @@ function ownFree(G, pid, tk) {
   if (t.tree) return [null, fail('На клетке дерево')];
   return [t, null];
 }
-function actBuyUnit(G, pid, tk, type) {
+// куда можно «выставить» нанятого солдата с клетки-постройки: на соседнюю нейтральную или вражескую (воюете) клетку, если его атака больше её защиты
+function outpostTargets(G, pid, from, type) {
+  const res = new Map(), U = CFG.units[type];
+  if (!U || U.cannon || !from || from.owner !== pid) return res;
+  for (const n of nbrs(G, from)) {
+    if (n.owner === pid) continue;
+    if (n.owner >= 0 && relOf(G, pid, n.owner) !== 'war') continue;
+    if (U.atk > tileDef(G, n)) res.set(n, n.owner < 0 ? 'claim' : 'attack');
+  }
+  return res;
+}
+function actBuyUnit(G, pid, tk, type, toKey) {
   const g = guard(G, pid); if (g) return g;
   if (!isInt(type) || !has(CFG.units, type)) return fail('Неизвестный тип войска');
   const U = CFG.units[type];
+  if (U.cannon) {
+    if (!isSiege(G)) return fail('Пушки есть только в осадном режиме');
+    if (toKey) return fail('Пушку можно поставить только на свою клетку');
+    if (cannonCount(G, pid) >= CFG.cannon.max) return fail('Пушек не больше ' + CFG.cannon.max);
+  }
+  const fresh = !!G.opts.fresh;                      // дуэль: нанятый солдат ходит только со следующего хода
+  if (toKey !== undefined && toKey !== null) {       // найм «через границу»: с клетки-постройки сразу на соседнюю клетку
+    if (typeof tk !== 'string' || typeof toKey !== 'string') return fail('Неверный запрос');
+    const from = G.tiles.get(tk), to = G.tiles.get(toKey);
+    if (!from || !to) return fail('Нет такой клетки');
+    if (from.owner !== pid) return fail('Это не ваша клетка');
+    if (!from.building) return fail('Нанимать через границу можно с клетки с постройкой');
+    if (hexDist(from, to) !== 1) return fail('Только на соседнюю клетку');
+    if (to.owner === pid) return fail('Это ваша клетка — наймите солдата на свободную клетку');
+    if (to.owner >= 0 && relOf(G, pid, to.owner) !== 'war') return fail('С этим игроком ' + (relOf(G, pid, to.owner) === 'alliance' ? 'альянс' : 'дружба') + ' — сначала объявите войну');
+    if (U.atk <= tileDef(G, to)) return fail('Недостаточная сила атаки (защита клетки ' + tileDef(G, to) + ')');
+    if (fundsAt(G, from) < U.cost) return fail('Недостаточно монет');
+    spendAt(G, from, U.cost);
+    const old = to.owner;
+    takeTile(G, pid, to, { id: G.nextId++, type, owner: pid, moved: true, fresh, born: G.round });
+    return ok(old >= 0 ? 'Клетка захвачена' : 'Земля занята', { kind: old >= 0 ? 'attack' : 'claim' });
+  }
   const [t, e] = ownFree(G, pid, tk); if (e) return e;
-  const P = G.players[pid];
-  if (P.money < U.cost) return fail('Недостаточно монет');
-  P.money -= U.cost;
-  const fresh = !!G.opts.fresh;                      // дуэль: нанятый солдат стоит на своей клетке и ходит только со следующего хода
+  if (fundsAt(G, t) < U.cost) return fail('Недостаточно монет');
+  spendAt(G, t, U.cost);
   t.unit = { id: G.nextId++, type, owner: pid, moved: fresh, fresh, born: G.round };
   return ok('Нанят: ' + U.name);
+}
+// улучшение фермы до II уровня (только в осадном режиме)
+function actUpgrade(G, pid, tk) {
+  const g = guard(G, pid); if (g) return g;
+  if (!isSiege(G)) return fail('Улучшать фермы можно только в осадном режиме');
+  const t = typeof tk === 'string' ? G.tiles.get(tk) : null;
+  if (!t) return fail('Нет такой клетки');
+  if (t.owner !== pid) return fail('Это не ваша клетка');
+  if (t.building === 'farm2') return fail('Ферма уже улучшена');
+  if (t.building !== 'farm') return fail('Улучшать можно только ферму');
+  const B = CFG.buildings.farm2;
+  if (fundsAt(G, t) < B.cost) return fail('Недостаточно монет');
+  spendAt(G, t, B.cost); t.building = 'farm2';
+  return ok('Ферма улучшена до II уровня');
+}
+// цели пушки: вражеские солдаты и корабли (с кем воюем) в радиусе CFG.cannon.range
+function getFireTargets(G, from) {
+  const res = new Map(), u = from && from.unit;
+  if (!u || !CFG.units[u.type].cannon) return res;
+  const p = u.owner, R = CFG.cannon.range;
+  for (const t of G.tiles.values()) if (t.unit && t.unit.owner !== p && hexDist(from, t) <= R && relOf(G, p, t.unit.owner) === 'war') res.set(t, 'fire');
+  for (const s of G.sea.values()) if (s.ship && s.ship.owner !== p && hexDist(from, s) <= R && relOf(G, p, s.ship.owner) === 'war') res.set(s, 'fire');
+  return res;
+}
+function actFire(G, pid, fk, tk) {
+  const g = guard(G, pid); if (g) return g;
+  if (!isSiege(G)) return fail('Пушки есть только в осадном режиме');
+  if (typeof fk !== 'string' || typeof tk !== 'string') return fail('Неверный запрос');
+  const from = G.tiles.get(fk), to = tileAt(G, tk);
+  if (!from || !to) return fail('Нет такой клетки');
+  const u = from.unit;
+  if (!u || u.owner !== pid || !CFG.units[u.type].cannon) return fail('Здесь нет вашей пушки');
+  if (u.fresh) return fail('Пушка только что куплена — стрелять будет со следующего хода');
+  if (u.moved) return fail('Пушка уже стреляла в этом ходу');
+  if (hexDist(from, to) > CFG.cannon.range) return fail('Слишком далеко: пушка бьёт на ' + CFG.cannon.range + ' клеток');
+  const victim = to.sea ? (to.ship ? to.ship.owner : -1) : (to.unit ? to.unit.owner : -1);
+  if (victim < 0 || victim === pid) return fail('Там нет вражеского солдата или корабля');
+  if (relOf(G, pid, victim) !== 'war') return fail('С этим игроком ' + (relOf(G, pid, victim) === 'alliance' ? 'альянс' : 'дружба') + ' — сначала объявите войну');
+  let what;
+  if (to.sea) { what = to.ship.cargo ? 'корабль с солдатом' : 'корабль'; if (to.ship.cargo) addLost(G, victim, 1); to.ship = null; }
+  else { what = CFG.units[to.unit.type].cannon ? 'пушку' : 'солдата'; addLost(G, victim, 1); to.unit = null; }
+  u.moved = true;
+  noteAttack(G, pid, victim, key(to.q, to.r));
+  G.shotId = (G.shotId | 0) + 1;
+  G.shots = (G.shots || []).concat([{ id: G.shotId, a: [from.q, from.r], b: [to.q, to.r], sea: !!to.sea }]).slice(-6);
+  ev(G, '💥 ' + pname(G, pid) + ': пушка уничтожила ' + what + ' (' + pname(G, victim) + ')');
+  return ok('Выстрел: уничтожен(а) ' + what, { kind: 'fire' });
 }
 function actBuild(G, pid, tk, kind) {
   const g = guard(G, pid); if (g) return g;
   if (typeof kind !== 'string' || !has(CFG.buildings, kind)) return fail('Неизвестная постройка');
   const B = CFG.buildings[kind];
-  const [t, e] = ownFree(G, pid, tk); if (e) return e;
+  if (B.upgrade) return fail('Это улучшение фермы — нажмите «Улучшить» на ферме');
+  let t, e;
+  const raw = typeof tk === 'string' ? G.tiles.get(tk) : null;
+  if (raw && raw.owner === pid && !raw.unit && (raw.building === 'tower' || raw.building === 'fort') && (kind === 'tower' || kind === 'fort')) {
+    if (raw.building === kind) return fail('Здесь уже стоит ' + B.name.toLowerCase());
+    t = raw;                                          // башню можно заменить на другую: прежняя исчезает сама
+  } else [t, e] = ownFree(G, pid, tk);
+  if (e) return e;
   if (t.res) return fail('На клетке месторождение — стройка невозможна');
   if (kind === 'farm' && !farmSpotOk(G, pid, t)) return fail('В дуэли ферму можно строить только рядом с другой своей фермой');
-  const P = G.players[pid], cost = buildCost(G, pid, kind);
-  if (P.money < cost) return fail('Недостаточно монет');
-  P.money -= cost; t.building = kind;
-  return ok('Построено: ' + B.name);
+  const cost = buildCost(G, pid, kind);
+  if (fundsAt(G, t) < cost) return fail('Недостаточно монет');
+  const replaced = t.building; spendAt(G, t, cost); t.building = kind;
+  return ok(replaced ? 'Заменено: ' + CFG.buildings[replaced].name + ' → ' + B.name : 'Построено: ' + B.name);
 }
 // спустить корабль на воду с береговой клетки
 function actBuyShip(G, pid, lk, sk) {
@@ -763,9 +1109,8 @@ function actBuyShip(G, pid, lk, sk) {
   if (!sea) return fail('Корабль можно спустить только на воду');
   if (hexDist(land, sea) !== 1) return fail('Вода должна быть рядом с береговой клеткой');
   if (sea.ship) return fail('Там уже стоит корабль');
-  const P = G.players[pid];
-  if (P.money < CFG.ship.cost) return fail('Недостаточно монет');
-  P.money -= CFG.ship.cost;
+  if (fundsAt(G, land) < CFG.ship.cost) return fail('Недостаточно монет');
+  spendAt(G, land, CFG.ship.cost);
   sea.ship = { id: G.nextId++, owner: pid, moved: false, cargo: null };
   return ok('Корабль спущен на воду');
 }
@@ -798,8 +1143,70 @@ function cutOff(G, pid) {
   if (comps.length < 2) return;
   comps.sort((a, b) => b.length - a.length);
   let lost = 0;
-  for (let i = 1; i < comps.length; i++) for (const t of comps[i]) { t.owner = -1; t.unit = null; t.building = null; lost++; }
+  for (let i = 1; i < comps.length; i++) for (const t of comps[i]) { if (t.unit) addLost(G, pid, 1); t.owner = -1; t.unit = null; t.building = null; t.f = 0; lost++; }
   ev(G, pname(G, pid) + ': отрезано клеток — ' + lost);
+}
+
+// ---- отрезанные куски страны (как в Antiyoy): земля остаётся, но у куска своя казна и своя экономика ----
+function fragsOf(G) { return G.frags || (G.frags = {}); }
+function addLost(G, pid, n) { const P = G.players[pid]; if (P) P.lost = (P.lost | 0) + (n | 0); }
+function fundsAt(G, t) { if (t.f) { const F = fragsOf(G)[t.f]; if (F && F.owner === t.owner) return F.money; } return G.players[t.owner].money; }
+function spendAt(G, t, amt) { if (t.f) { const F = fragsOf(G)[t.f]; if (F && F.owner === t.owner) { F.money -= amt; return; } } G.players[t.owner].money -= amt; }
+function fragCount(G, pid) { let n = 0; const fr = fragsOf(G); for (const k in fr) if (fr[k].owner === pid) n++; return n; }
+function relabel(G, pid) {
+  const P = G.players[pid], fr = fragsOf(G);
+  const own = [...G.tiles.values()].filter(t => t.owner === pid);
+  const seen = new Set(), comps = [];
+  for (const t of own) {
+    if (seen.has(t)) continue;
+    const comp = [t]; seen.add(t);
+    for (let i = 0; i < comp.length; i++) for (const m of nbrs(G, comp[i])) if (m.owner === pid && !seen.has(m)) { seen.add(m); comp.push(m); }
+    comps.push(comp);
+  }
+  const mine = id => fr[id] && fr[id].owner === pid;
+  if (comps.length < 2 && !own.some(t => t.f) && !Object.keys(fr).some(k => mine(k))) return;
+  comps.sort((a, b) => b.length - a.length);
+  const kept = new Set();
+  comps.forEach((comp, i) => {
+    const ids = {};
+    for (const t of comp) if (t.f && mine(t.f)) ids[t.f] = (ids[t.f] || 0) + 1;
+    const list = Object.keys(ids).map(Number).filter(id => !kept.has(id)).sort((a, b) => ids[b] - ids[a]);
+    if (i === 0) {                                     // основная часть: казны вернувшихся кусков вливаются в общую
+      for (const id of list) { P.money += fr[id].money; delete fr[id]; }
+      for (const t of comp) t.f = 0;
+      return;
+    }
+    let id;
+    if (list.length) {
+      id = list[0];
+      for (const o of list.slice(1)) { fr[id].money += fr[o].money; delete fr[o]; }
+    } else {
+      id = G.nextFrag = (G.nextFrag | 0) + 1;
+      fr[id] = { owner: pid, money: 0 };
+      ev(G, pname(G, pid) + ': часть земли отрезана, клеток — ' + comp.length + ', у неё своя казна');
+    }
+    kept.add(id);
+    for (const t of comp) t.f = id;
+  });
+  for (const k of Object.keys(fr)) if (mine(k) && !kept.has(+k)) delete fr[k];   // кусок исчез целиком
+}
+// ход отрезанных кусков: свой доход и содержание; не хватает денег — войска распускаются
+function tickFrags(G, pid) {
+  const fr = fragsOf(G);
+  for (const k of Object.keys(fr)) {
+    const F = fr[k]; if (F.owner !== pid) continue;
+    const tiles = [...G.tiles.values()].filter(t => t.owner === pid && t.f === +k);
+    F.money += econ(G, pid, +k).net;
+    let n = 0;
+    while (F.money < 0) {
+      let w = null;
+      for (const t of tiles) if (t.unit && (!w || CFG.units[t.unit.type].upkeep > CFG.units[w.unit.type].upkeep)) w = t;
+      if (!w) break;
+      F.money += CFG.units[w.unit.type].upkeep; w.unit = null; n++;
+    }
+    if (F.money < 0) F.money = 0;
+    if (n) { addLost(G, pid, n); ev(G, pname(G, pid) + ': отрезанному куску нечем платить — солдат распалось: ' + n); }
+  }
 }
 
 // ---- золотые жилы: не больше CFG.gold.max на карте, живут CFG.res.gold.life ходов, +10 монет владельцу клетки ----
@@ -830,8 +1237,8 @@ function expireTreaties(G) {
     changed = true; dropProps(G, a, b);
     if (!A.alive || !B.alive) { delete G.dipl.rel[pk]; continue; }
     if (r.lvl === 'war') {
-      if (allyBound(G, a, b) || allyBound(G, b, a)) { G.dipl.rel[pk] = { lvl: 'war', since: r.since, until: 0 }; ev(G, '⚔ Срок войны истёк, но союз не даёт ' + A.name + ' и ' + B.name + ' помириться'); continue; }
-      G.dipl.rel[pk] = { lvl: 'peace', since: G.round, until: 0 }; ev(G, '🕊 Срок войны истёк: ' + A.name + ' и ' + B.name + ' заключили мир');
+      if (allyBound(G, a, b) || allyBound(G, b, a)) { G.dipl.rel[pk] = { lvl: 'war', since: r.since, until: 0, aid: r.aid }; ev(G, '⚔ Срок войны истёк, но союз не даёт ' + A.name + ' и ' + B.name + ' помириться'); continue; }
+      G.dipl.rel[pk] = { lvl: 'peace', since: G.round, until: 0 }; ev(G, '🕊 Срок войны истёк: ' + A.name + ' и ' + B.name + ' заключили мир'); endAidWars(G, a, b); endAidWars(G, b, a);
     } else if (r.lvl === 'peace') { G.dipl.rel[pk] = { lvl: 'war', since: G.round, until: 0 }; ev(G, '⚔ Срок дружбы истёк: ' + A.name + ' и ' + B.name + ' снова воюют'); }
     else delete G.dipl.rel[pk];
   }
@@ -839,13 +1246,17 @@ function expireTreaties(G) {
 }
 
 function growTrees(G) {
-  const trees = [...G.tiles.values()].filter(t => t.tree && t.owner < 0);
+  // деревья разрастаются и на нейтральной, и на чужой/своей земле (если там нет войска, постройки и месторождения); дерево на территории государства съедает доход клетки (+1)
+  const trees = [...G.tiles.values()].filter(t => t.tree);
   for (const t of trees) {
     t.treeTimer--;
     if (t.treeTimer > 0) continue;
     t.treeTimer = rint(G, CFG.treeSpreadMin, CFG.treeSpreadMax);
-    const c = nbrs(G, t).filter(n => n.owner < 0 && !n.tree && !n.res);
-    if (c.length) { const n = c[Math.floor(rnd(G) * c.length)]; n.tree = true; n.treeTimer = rint(G, CFG.treeSpreadMin, CFG.treeSpreadMax); }
+    const c = nbrs(G, t).filter(n => !n.tree && !n.res && !n.unit && !n.building);
+    if (!c.length) continue;
+    const n = c[Math.floor(rnd(G) * c.length)];
+    if (n.owner >= 0 && rnd(G) < 0.45) continue;                  // на населённую землю лес наступает медленнее
+    n.tree = true; n.treeTimer = rint(G, CFG.treeSpreadMin, CFG.treeSpreadMax);
   }
 }
 
@@ -894,19 +1305,23 @@ function startTurn(G, pid) {
   const P = G.players[pid];
   for (const t of G.tiles.values()) if (t.owner === pid && t.unit) { t.unit.moved = false; t.unit.fresh = false; }
   for (const s of G.sea.values()) if (s.ship && s.ship.owner === pid) { s.ship.moved = false; if (s.ship.cargo) s.ship.cargo.moved = false; }
-  const e = econ(G, pid);
+  undoClear(G); G.undoN = 0;
+  if (!G.opts.connectivity) relabel(G, pid);
+  const e = econ(G, pid, G.opts.connectivity ? undefined : 0);
   P.money += e.net;
+  payDebts(G, pid);
   for (const t of G.tiles.values()) if (t.owner === pid && t.res && t.res.kind !== 'gold' && --t.res.left <= 0) { t.res = null; ev(G, P.name + ': месторождение истощено'); }
   if (P.money < 0) {
-    for (const t of G.tiles.values()) if (t.owner === pid && t.unit) t.unit = null;
-    for (const s of G.sea.values()) if (s.ship && s.ship.owner === pid) s.ship = null;
+    for (const t of G.tiles.values()) if (t.owner === pid && t.unit && !t.f) { t.unit = null; addLost(G, pid, 1); }
+    for (const s of G.sea.values()) if (s.ship && s.ship.owner === pid) { if (s.ship.cargo) addLost(G, pid, 1); s.ship = null; }
     P.money = 0;
     ev(G, P.name + ': банкротство — все войска и корабли потеряны!');
   }
+  if (!G.opts.connectivity) tickFrags(G, pid);
 }
 
 function advanceTurn(G) {
-  if (G.opts.connectivity) for (const p of G.players) if (p.alive) cutOff(G, p.id);
+  for (const p of G.players) if (p.alive) { if (G.opts.connectivity) cutOff(G, p.id); else relabel(G, p.id); }
   updateStatus(G);
   if (G.over) return;
   const n = G.players.length;
@@ -932,7 +1347,7 @@ function actResign(G, pid) {
   if (G.over) return fail('Партия окончена');
   const P = G.players[pid];
   if (!P || !P.alive) return fail('Вы уже выбыли');
-  const wasCur = G.cur === pid;
+  const wasCur = G.cur === pid; undoClear(G); G.undoN = 0;
   for (const t of G.tiles.values()) if (t.owner === pid) { t.owner = -1; t.unit = null; t.building = null; }
   for (const s of G.sea.values()) if (s.ship && s.ship.owner === pid) s.ship = null;
   ev(G, P.name + ' сдался');
@@ -944,20 +1359,40 @@ function actResign(G, pid) {
 
 function applyAction(G, pid, a) {
   if (!a || typeof a !== 'object') return fail('Пустое действие');
+  if (a.type === 'undo') return actUndo(G, pid);
+  const human = G.players[pid] && !G.players[pid].ai && !G.over && G.cur === pid;
+  const snap = human && UNDOABLE[a.type] ? undoSnap(G) : null;
+  const r = applyRaw(G, pid, a);
+  if (r.ok) {
+    if (snap) { const st = undoStack(G); st.push(snap); if (st.length > CFG.undoMax) st.shift(); G.undoN = st.length; }
+    else if (a.type !== 'undo') { undoClear(G); G.undoN = 0; }       // конец хода, дипломатия и пр. — дальше назад не откатиться
+  }
+  return r;
+}
+function applyRaw(G, pid, a) {
   switch (a.type) {
     case 'move': return actMove(G, pid, a.from, a.to);
-    case 'buy': return actBuyUnit(G, pid, a.tile, a.unit);
+    case 'buy': return actBuyUnit(G, pid, a.tile, a.unit, a.to);
+    case 'upgrade': return actUpgrade(G, pid, a.tile);
+    case 'fire': return actFire(G, pid, a.from, a.to);
     case 'build': return actBuild(G, pid, a.tile, a.kind);
     case 'ship': return actBuyShip(G, pid, a.tile, a.sea);
     case 'disband': return actDisband(G, pid, a.tile);
     case 'end': return actEndTurn(G, pid);
-    case 'propose': return actPropose(G, pid, a.to, a.level, a.turns);
+    case 'propose': return actPropose(G, pid, a.to, a.level, a.turns, a.pay, a.mode);
     case 'respond': return actRespond(G, pid, a.id, !!a.accept);
     case 'war': return actWar(G, pid, a.to, a.turns);
     case 'leave': return actLeave(G, pid);
     case 'gift': return actGift(G, pid, a.to, a.amount);
     case 'ask': return actAsk(G, pid, a.to, a.amount);
     case 'hire': return actHire(G, pid, a.to, a.target, a.amount);
+    case 'trade': return actTrade(G, pid, a.to);
+    case 'untrade': return actCancelTrade(G, pid, a.to);
+    case 'loan': return actLoan(G, pid, a.to, a.amount, 'loan');
+    case 'borrow': return actLoan(G, pid, a.to, a.amount, 'borrow');
+    case 'help': return actHelp(G, pid, a.to, a.target);
+    case 'kick': return actKick(G, pid, a.target);
+    case 'dissolve': return actDissolve(G, pid);
     case 'resign': return actResign(G, pid);
   }
   return fail('Неизвестное действие');
@@ -970,8 +1405,8 @@ function applyAction(G, pid, a) {
 // =====================================================================
 function tileValue(t) {
   let v = 1;
-  if (t.building === 'farm') v += 6; else if (t.building) v += 2;
-  if (t.unit) v += 0.6 * t.unit.type;
+  if (t.building === 'farm') v += 6; else if (t.building === 'farm2') v += 9; else if (t.building) v += 2;
+  if (t.unit) v += t.unit.type === 5 ? 3 : 0.6 * t.unit.type;
   return v;
 }
 
@@ -986,7 +1421,10 @@ function aiCtx(G, pid) {
       else if (t.owner < 0) c.targets.push(t);
     }
   }
-  c.e = econ(G, pid);
+  c.cannons = [];                                                    // вражеские пушки (осадный режим): их радиус поражения — опасная зона
+  if (isSiege(G)) for (const t of c.enemyTiles) if (t.unit && CFG.units[t.unit.type].cannon) c.cannons.push(t);
+  c.e = econ(G, pid, G.opts.connectivity ? undefined : 0);
+  { const mny = G.players[pid].money; c.bold = mny > 400 ? 0.2 : mny > 200 ? 0.5 : 1; }     // богатому боту не страшно потерять солдата — он смелее идёт на риск
   c.maxEnemyTiles = 0;
   for (const e of c.war) { c.maxEnemyTiles = Math.max(c.maxEnemyTiles, G.players[e].tiles); }
   c.threat = new Map();
@@ -1020,6 +1458,11 @@ function supportDef(G, pid, n) {
     if (s.building) best = Math.max(best, CFG.buildings[s.building].def);
   }
   return best;
+}
+function cannonDanger(n, c) {
+  if (!c.cannons || !c.cannons.length) return 0;
+  let d = 0; for (const t of c.cannons) if (hexDist(t, n) <= CFG.cannon.range) d++;
+  return Math.min(2, d);
 }
 function riskAt(G, pid, n, c) {
   let th = 0;
@@ -1059,8 +1502,8 @@ function captureValue(G, pid, n, kind, utype, c) {
     if (ns.some(x => c.war.has(x.owner))) val += 0.6;
   } else {
     val = 3 + 0.1 * adjMine;
-    if (n.building === 'farm') val += 6; else if (n.building) val += 2;
-    if (n.unit) val += 1.5 + 1.2 * n.unit.type;
+    if (n.building === 'farm') val += 6; else if (n.building === 'farm2') val += 9; else if (n.building) val += 2;
+    if (n.unit) val += 1.5 + (n.unit.type === 5 ? 3 : 1.2 * n.unit.type);
     const ep = G.players[n.owner];
     if (ep.tiles <= 1) val += 12; else val += Math.max(0, c.maxEnemyTiles - ep.tiles) * 0.03;
     if (G.opts.connectivity) val += 0.8 * splitGain(G, n, c);
@@ -1068,7 +1511,9 @@ function captureValue(G, pid, n, kind, utype, c) {
   if (n.res) val += CFG.res[n.res.kind].income * Math.min(n.res.left, resLife(n.res.kind)) * 0.12;   // временная «ферма» (золото — самая ценная)
   const th = riskAt(G, pid, n, c);
   const newDef = Math.max(CFG.units[utype].def, supportDef(G, pid, n));
-  if (th > newDef) val -= (kind === 'attack' ? 1.0 : 0.5) + CFG.units[utype].cost * 0.04;
+  if (th > newDef) val -= ((kind === 'attack' ? 1.0 : 0.5) + CFG.units[utype].cost * 0.04) * (c.bold === undefined ? 1 : c.bold);
+  const cd = cannonDanger(n, c);                                      // под прицелом вражеской пушки солдат погибнет, не защитив клетку
+  if (cd) val -= cd * (0.9 + CFG.units[utype].cost * 0.04) * (c.bold === undefined ? 1 : c.bold);
   c.cache.set(ck, val);
   return val;
 }
@@ -1122,7 +1567,8 @@ function aiDefend(G, pid, c) {
     if (th > tileDef(G, t) && th <= 3) vuln.push({ t, th, v: tileValue(t) });
   }
   if (!vuln.length) return null;
-  const free = c.mine.filter(t => !t.unit && !t.building && !t.tree);
+  const free = c.mine.filter(t => !t.unit && !t.building && !t.tree && !t.f);
+  if (free.length < 3 && !c.threat.size) return null;
   let best = null;
   for (const kind of ['tower', 'fort']) {
     const B = CFG.buildings[kind];
@@ -1145,9 +1591,10 @@ function aiFortify(G, pid, c) {
   const P = G.players[pid], e = c.e, B = CFG.buildings.tower;
   const A = CFG.ai;
   if (e.towers >= e.farms + A.fortExtra || !affordable(G, P, e, B.cost + 20, B.upkeep) || e.net < A.fortNet) return null;
+  if (c.mine.filter(t => !t.unit && !t.building && !t.tree && !t.f).length < 5 || e.towers >= Math.max(3, Math.floor(e.tiles / 6))) return null;      // не застраиваем всю землю башнями
   let best = null;
   for (const t of c.mine) {
-    if (t.unit || t.building || t.tree || t.res || tileDef(G, t) >= 2) continue;
+    if (t.unit || t.building || t.tree || t.res || t.f || tileDef(G, t) >= 2) continue;
     const ns = nbrs(G, t);
     if (!ns.some(x => c.war.has(x.owner)) && !ns.some(x => x.owner === pid && nbrs(G, x).some(y => c.war.has(y.owner)))) continue;
     let v = 0;
@@ -1168,18 +1615,70 @@ function aiFarm(G, pid, c) {
   // «план» ферм растёт вместе с землёй; всё, что сверх плана, строим, когда копятся лишние деньги — казна не должна лежать мёртвым грузом
   const want = Math.floor(e.tiles / (contact ? CFG.ai.farmDiv - 1 : 2.5)) + 2;
   if (e.farms >= want && P.money < cost + 45) return null;
-  if (e.farms >= 0.62 * e.tiles) return null;
-  const free = c.mine.filter(t => !t.unit && !t.building && !t.tree && !t.res && farmSpotOk(G, pid, t));
+  if (e.farms >= 0.55 * e.tiles) return null;
+  if (e.tiles < 5) return null;                                       // с маленькой землёй сначала расширяемся: ферма не должна занять последнюю клетку под найм
+  const room = c.mine.filter(t => !t.unit && !t.building && !t.tree && !t.f).length;
+  if (room < 4) return null;                                          // оставляем клетки для найма войск и посадки десанта
+  const free = c.mine.filter(t => !t.unit && !t.building && !t.tree && !t.f && !t.res && farmSpotOk(G, pid, t));
   if (!free.length) return null;
   let bt = null, bv = 1e9;
   for (const t of free) {
     const ns = nbrs(G, t);
     // ферму прячем вглубь: подальше от чужих, от угроз и от моря (десант), рядом с другими своими фермами
     const v = ns.filter(x => x.owner !== pid).length + (c.threat.get(t) || 0) * 2 + ns.reduce((s, x) => s + (c.threat.get(x) || 0), 0) * 0.3
-      - ns.filter(x => x.owner === pid && x.building === 'farm').length * 0.25 + rnd(G) * 0.5;
+      - ns.filter(x => x.owner === pid && isFarm(x.building)).length * 0.25 + rnd(G) * 0.5;
     if (v < bv) { bv = v; bt = t; }
   }
   return bt ? applyAction(G, pid, { type: 'build', tile: key(bt.q, bt.r), kind: 'farm' }) : null;
+}
+
+// ---------- осадный режим: пушки и улучшение ферм ----------
+// выстрел: самая дорогая цель в радиусе (дорогой солдат, корабль с десантом, вражеская пушка)
+function aiFire(G, pid, c) {
+  if (!isSiege(G)) return null;
+  let best = null;
+  for (const t of c.mine) {
+    const u = t.unit; if (!u || !CFG.units[u.type].cannon || u.moved || u.fresh) continue;
+    for (const [n] of getFireTargets(G, t)) {
+      const val = n.sea ? CFG.ship.cost + (n.ship.cargo ? CFG.units[n.ship.cargo.type].cost : 0) : CFG.units[n.unit.type].cost + CFG.units[n.unit.type].upkeep * 0.3;
+      if (!best || val > best.val) best = { val, t, n };
+    }
+  }
+  return best ? applyAction(G, pid, { type: 'fire', from: key(best.t.q, best.t.r), to: key(best.n.q, best.n.r) }) : null;
+}
+// покупка пушки: только если казна её тянет (−60/ход!) и в радиусе поражения есть что бить
+function aiCannon(G, pid, c) {
+  if (!isSiege(G) || G.maxRounds) return null;
+  const P = G.players[pid], e = c.e, U = CFG.units[5];
+  if (cannonCount(G, pid) >= CFG.cannon.max) return null;
+  if (!affordable(G, P, e, U.cost + 30, U.upkeep) || e.net - U.upkeep < 6) return null;
+  const foes = [];
+  for (const t of G.tiles.values()) if (t.unit && c.war.has(t.unit.owner)) foes.push(t);
+  for (const s of G.sea.values()) if (s.ship && c.war.has(s.ship.owner)) foes.push(s);
+  if (foes.length < 2) return null;
+  let best = null;
+  for (const t of c.mine) {
+    if (t.unit || t.building || t.tree || t.f || t.res) continue;
+    let v = 0;
+    for (const f of foes) if (hexDist(t, f) <= CFG.cannon.range) v += f.sea ? 2 : 1 + f.unit.type * 0.6;
+    if ((c.threat.get(t) || 0) > Math.max(tileDef(G, t), U.def)) v -= 3;     // на самой границе пушку тут же захватят
+    if (!best || v > best.v) best = { v, t };
+  }
+  return best && best.v >= 4 ? applyAction(G, pid, { type: 'buy', tile: key(best.t.q, best.t.r), unit: 5 }) : null;
+}
+function aiUpgrade(G, pid, c) {
+  if (!isSiege(G)) return null;
+  const P = G.players[pid], B = CFG.buildings.farm2, gain = B.income - CFG.buildings.farm.income;
+  const left = G.maxRounds ? G.maxRounds - G.round + 1 : 60;
+  if (P.money < B.cost + 10 || B.cost / gain + 1 > left) return null;
+  if (c.threat.size > 0 && P.money - B.cost < CFG.units[2].cost) return null;
+  let bt = null, bv = 1e9;
+  for (const t of c.mine) {
+    if (t.building !== 'farm' || t.f) continue;
+    const v = (c.threat.get(t) || 0) * 2 + nbrs(G, t).filter(x => x.owner !== pid).length + rnd(G) * 0.5;      // прячем вглубь: сперва улучшаем самые безопасные фермы
+    if (v < bv) { bv = v; bt = t; }
+  }
+  return bt ? applyAction(G, pid, { type: 'upgrade', tile: key(bt.q, bt.r) }) : null;
 }
 
 // Экономия: лишних солдат, которым нечего захватывать и некого защищать, распускаем — содержание Барона/Рыцаря съедает прибыль.
@@ -1209,7 +1708,7 @@ function aiTrim(G, pid, c) {
 
 function aiBuy(G, pid, c) {
   const P = G.players[pid], e = c.e;
-  const free = c.mine.filter(t => !t.unit && !t.building && !t.tree);
+  const free = c.mine.filter(t => !t.unit && !t.building && !t.tree && !t.f);
   if (!free.length) return null;
   // дуэль: свежие солдаты ходят только в следующем ходу — цели, которые они уже «держат», повторно не закупаем
   const covered = new Set();
@@ -1252,12 +1751,37 @@ function aiPosition(G, pid, c) {
   return best ? applyAction(G, pid, { type: 'move', from: key(best.from.q, best.from.r), to: key(best.to.q, best.to.r) }) : null;
 }
 
-function aiMerge(G, pid, c) {
+// расчищаем деревья на своей земле: достаточно поставить на клетку войско, дерево съедает доход
+function aiClear(G, pid, c) {
+  let best = null;
   for (const t of c.mine) {
-    if (!t.unit || t.unit.moved || t.unit.type > 2) continue;
-    if (!c.enemyTiles.some(x => hexDist(x, t) <= 4)) continue;
+    if (!t.unit || t.unit.moved) continue;
+    for (const [n, kind] of getMoves(G, t)) if (kind === 'move' && n.tree && !n.f === !t.f) { const d = hexDist(t, n); if (!best || d < best.d) best = { d, t, n }; }
+  }
+  if (best) return applyAction(G, pid, { type: 'move', from: key(best.t.q, best.t.r), to: key(best.n.q, best.n.r) });
+  // свободных войск нет — нанимаем крестьянина рядом с деревом
+  const P = G.players[pid];
+  if (P.money < CFG.units[1].cost + 15 || c.e.net < 3) return null;
+  const trees = c.mine.filter(t => t.tree && !t.f);
+  if (!trees.length) return null;
+  for (const f of c.mine) {
+    if (f.unit || f.building || f.tree || f.f) continue;
+    const mv = getMoves(G, f, { id: 0, type: 1, owner: pid, moved: false });
+    if (trees.some(t => mv.get(t) === 'move')) return applyAction(G, pid, { type: 'buy', tile: key(f.q, f.r), unit: 1 });
+  }
+  return null;
+}
+function aiMerge(G, pid, c) {
+  // «осада»: враг за башнями/фортом, а сильнее барона у нас никого нет — сливаем двух баронов в рыцаря (содержание то же, атака 4 пробивает любую защиту)
+  let maxAtk = 0; for (const t of c.mine) if (t.unit && !CFG.units[t.unit.type].cannon) maxAtk = Math.max(maxAtk, CFG.units[t.unit.type].atk);
+  let blocked = false;
+  if (maxAtk && maxAtk < 4) for (const x of c.enemyTiles) if (tileDef(G, x) >= maxAtk && c.mine.some(m => hexDist(m, x) <= 3)) { blocked = true; break; }
+  for (const t of c.mine) {
+    if (!t.unit || t.unit.moved || t.unit.type > (blocked ? 3 : 2) || CFG.units[t.unit.type].cannon) continue;
+    if (!c.enemyTiles.some(x => hexDist(x, t) <= (blocked ? 8 : 4))) continue;
     const a = t.unit.type, delta = CFG.units[a + 1].upkeep - 2 * CFG.units[a].upkeep;
-    if (c.e.net - delta < 4) continue;
+    if (blocked && a !== maxAtk) continue;
+    if (c.e.net - delta < (blocked ? 0 : 4)) continue;
     for (const [n, kind] of getMoves(G, t)) if (kind === 'merge') return applyAction(G, pid, { type: 'move', from: key(t.q, t.r), to: key(n.q, n.r) });
   }
   return null;
@@ -1300,6 +1824,10 @@ function planDiplomacy(G, pid) {
   const aliveN = G.players.filter(p => p.alive).length;
   const avg = G.players.filter(p => p.alive).reduce((t, p) => t + S[p.id], 0) / aliveN;
   const canPeace = b => !peaceBlock(G, pid, b);
+  // «копилка»: денег в казне больше, чем нужно на развитие — значит, пора воевать. Цель бота — захватить весь мир, а не копить монеты.
+  const hoardNow = P.money > 120 + 1.5 * Math.max(10, e.net);
+  const maxAlSize = Math.max(2, Math.floor((aliveN + 1) / 3));       // огромные союзы всех со всеми запрещены: иначе воевать становится не с кем
+  const weakReach = id => reach(id) && teamPower(id) < 0.9 * mine;      // слабый достижимый сосед — будущая добыча
 
   // коалиция против лидера: если кто-то заметно сильнее всех — остальные мирятся, объединяются и давят его
   let leader = null;
@@ -1322,20 +1850,35 @@ function planDiplomacy(G, pid) {
       if (!canPeace(f)) continue;                                // союз или минимальный срок войны не дают помириться — предложение просто истечёт
       score = (ratio - 0.75) * 2.2 + (ratio > 0.3 ? 0.5 * warOthers : 0) - 1.2 * betray + fav * 0.35;
       if (ratio < 0.6 && touch(f)) score -= 1.2;                 // сосед слабее нас — он лакомая добыча
-      score += rnd(G) * 0.5 - 0.25;
+      score += rnd(G) * 0.5 - 0.25 + (pr.pay || 0) / 18;
+      if (P.money >= 120 && weakReach(f) && !(pr.pay > 40)) score -= 1.8;          // слабого достижимого соседа мы собираемся покорить, а не мириться с ним
     } else if (pr.kind === 'treaty') {                           // предложение союза: либо в наш союз, либо в его, либо новый
-      const plan = joinPlan(G, f, pid);
+      const isSw = pr.mode === 'switch';
+      const plan = isSw ? switchPlan(G, f, pid) : joinPlan(G, f, pid);
       if (plan.err) continue;
       const common = others.some(p => p.id !== f && relOf(G, pid, p.id) === 'war' && relOf(G, f, p.id) === 'war');
       const exposed = warList.some(w => touch(w.id) && S[w.id] > 0.8 * mine);
       let pull = 0;                                              // союз тянет нас в войны: смотрим на сильных врагов будущих союзников
-      const team = plan.al ? plan.al.members : [f];
+      const team = isSw ? (plan.A ? plan.A.members : [f]) : (plan.al ? plan.al.members : [f]);
       for (const m of team) for (const w of others) if (m !== w.id && relOf(G, m, w.id) === 'war' && relOf(G, pid, w.id) !== 'war' && S[w.id] > 1.1 * mine && touch(w.id)) pull += 1;
       score = (common ? 1 : -0.4) + (exposed ? 0.9 : 0) + (teamPower(f) > mine * 1.1 ? 0.7 : 0) - 0.8 * pull - 1.5 * betray + fav * 0.35 + rnd(G) * 0.6 - 0.3;
+      if ((isSw ? (plan.A ? plan.A.members.length + 1 : 2) : (plan.al ? plan.al.members.length + 1 : 2)) > maxAlSize) score -= 9;         // союз уже достаточно большой
+      if (isSw) score += (teamPower(f) > 1.25 * teamPower(pid) ? 1.5 : -1.2) - 0.5;       // уходить из своего союза бот согласен, только если новый заметно сильнее
+      if (hoardNow && !exposed) score -= 2;
     } else if (pr.kind === 'ask') {
       const rel = relOf(G, pid, f);
       score = (rel === 'alliance' ? 1.6 : rel === 'peace' ? 0.4 : -2) + fav * 0.35 - 3 * pr.amount / Math.max(10, P.money) - betray;
       if (pr.amount > P.money * 0.4) score -= 2;
+    } else if (pr.kind === 'trade') {
+      score = 1.4 + fav * 0.3 - 0.9 * betray - (tradeCount(G, pid) >= CFG.diplo.tradeMax ? 9 : 0) + rnd(G) * 0.4 - 0.2;
+    } else if (pr.kind === 'loan') {                                // нам предлагают займ: берём, когда деньги нужны (проценты 20%)
+      score = (P.money < 60 ? 1.5 : P.money < 120 ? 0.2 : -1.5) + fav * 0.2 - (debtBetween(G, f, pid) ? 9 : 0);
+    } else if (pr.kind === 'borrow') {                              // нас просят в долг
+      const rel = relOf(G, pid, f);
+      score = (rel === 'alliance' ? 1.2 : 0.2) + fav * 0.4 - betray - (pr.amount > P.money * 0.35 ? 3 : 0) - (P.money - pr.amount < 40 ? 3 : 0) - (debtBetween(G, pid, f) ? 9 : 0);
+    } else if (pr.kind === 'help') {                                // просят вступить в войну
+      const t = pr.target, tr = S[t] / Math.max(1, mine), rel = relOf(G, pid, f);
+      score = (rel === 'alliance' ? 1.2 : 0) + fav * 0.4 - 1.6 * tr - (relOf(G, pid, t) === 'alliance' ? 9 : 0) - (lockLeft(G, pid, t) > 0 ? 9 : 0) - (favOf(G, pid, t) > 2 ? 1.5 : 0) + (touch(t) ? 0.6 : -0.6);
     } else {
       const t = pr.target, tr = S[t] / Math.max(1, mine);
       score = (pr.amount - 20 - 25 * tr) / 20 + fav * 0.3 - (relOf(G, pid, t) === 'alliance' ? 9 : 0) - (mine < S[t] * 0.8 ? 2 : 0) - (relOf(G, pid, f) === 'war' ? 5 : 0);
@@ -1353,6 +1896,10 @@ function planDiplomacy(G, pid) {
       const ally = others.filter(p => isMember(p.id) && S[p.id] * 1.5 < mine);
       const onlyAllies = others.every(p => isMember(p.id));          // кроме союзников никого не осталось — победить можно, только выйдя из союза
       if (!prey && ((ally.length && rnd(G) < 0.25) || (onlyAllies && rnd(G) < 0.12))) stab = true;
+    }
+    if (!bad && !stab && hoardNow && !warList.length && (!G.opts.allyWin || G.round > 40)) {       // копим казну, а воевать не с кем (все вокруг — союзники): выходим из союза и идём покорять
+      const preyOut = others.some(p => !isMember(p.id) && relOf(G, pid, p.id) !== 'alliance' && reach(p.id) && mine >= 0.7 * teamPower(p.id));
+      if (!preyOut && rnd(G) < 0.5) stab = true;
     }
     if (bad || stab) q.push({ type: 'leave' });
   }
@@ -1376,6 +1923,7 @@ function planDiplomacy(G, pid) {
     if (coal && p.id === coal.id && S[p.id] < 2.2 * mine) continue;
     if (!canPeace(p.id)) continue;
     if (prey && p.id === prey.id && teamPower(p.id) < mine * 0.85) continue;          // слабого соседа держим как цель
+    if (P.money >= 120 && weakReach(p.id)) continue;                                  // и любого слабого, до кого можем дотянуться флотом
     const need = S[p.id] > mine * 0.7 || warList.length >= 2 || !touch(p.id);
     if (!need || !mayPropose(p)) continue;
     // сильный бот предпочитает короткое перемирие (передышка), слабый — бессрочный мир
@@ -1383,7 +1931,7 @@ function planDiplomacy(G, pid) {
     q.push(pt ? { type: 'propose', to: p.id, level: 'peace', turns: pt } : { type: 'propose', to: p.id, level: 'peace' }); sent++;
   }
   // 3) союзы: оборонительный пакт с надёжным другом (общий враг, сильный сосед, лидер на горизонте) — бот создаёт союз или зовёт в свой
-  const maxAl = Math.max(3, Math.floor(aliveN / 2));
+  const maxAl = maxAlSize;
   if (sent < 3 && (!myAl || myAl.members.length < maxAl) && rnd(G) < 0.6) {
     const cands = others.filter(p => relOf(G, pid, p.id) === 'peace' && G.round - relSince(G, pid, p.id) >= 2 && p.betrayals === 0 && mayPropose(p)
       && !relUntil(G, pid, p.id) && !(myAl && allianceOf(G, p.id)) && !(allianceOf(G, p.id) && allianceOf(G, p.id).members.some(m => m !== pid && relOf(G, pid, m) === 'war')));
@@ -1409,6 +1957,29 @@ function planDiplomacy(G, pid) {
       if (strong) q.push({ type: 'gift', to: strong.id, amount: 25 });
     }
   }
+  // торговля: договор с мирным соседом даёт доход обоим
+  if (sent < 4 && tradeCount(G, pid) < CFG.diplo.tradeMax && rnd(G) < 0.5) {
+    const tp = others.find(p => relOf(G, pid, p.id) !== 'war' && !hasTrade(G, pid, p.id) && tradeCount(G, p.id) < CFG.diplo.tradeMax && !hasProp(G, pid, p.id, 'trade') && !onCooldown(G, pid, p.id) && favOf(G, p.id, pid) > -2);
+    if (tp) { q.push({ type: 'trade', to: tp.id }); sent++; }
+  }
+  // займ: на мели — просим у богатого друга; при избытке денег — предлагаем бедному союзнику
+  if (P.money < 12 && e.net <= 2 && !G.dipl.debts.some(d => d.to === pid)) {
+    const rich = others.filter(p => relOf(G, pid, p.id) !== 'war' && p.money >= 80 && !debtBetween(G, p.id, pid) && !hasProp(G, pid, p.id, 'borrow') && !onCooldown(G, pid, p.id)).sort((a, b) => b.money - a.money)[0];
+    if (rich) q.push({ type: 'borrow', to: rich.id, amount: 25 });
+  }
+  // выкуп мира: проигрываем соседу — платим за мир
+  if (warList.length && P.money >= 40 && sent < 4) {
+    const foe = warList.filter(w => touch(w.id) && S[w.id] > 1.25 * mine && canPeace(w.id) && !hasProp(G, pid, w.id, 'treaty') && !onCooldown(G, pid, w.id))[0];
+    if (foe && rnd(G) < 0.5) { q.push({ type: 'propose', to: foe.id, level: 'peace', pay: Math.min(60, Math.floor(P.money * 0.4)) }); sent++; }
+  }
+  // просьба о помощи: у нас война с сильным врагом, а друзья с ним в мире
+  if (warList.length && rnd(G) < 0.4) {
+    const target = warList.slice().sort((a, b) => S[b.id] - S[a.id])[0];
+    if (S[target.id] > 0.8 * mine) {
+      const hp = others.filter(p => p.id !== target.id && relOf(G, pid, p.id) !== 'war' && relOf(G, p.id, target.id) === 'peace' && lockLeft(G, p.id, target.id) === 0 && !hasProp(G, pid, p.id, 'help') && !onCooldown(G, pid, p.id)).sort((a, b) => favOf(G, b.id, pid) - favOf(G, a.id, pid))[0];
+      if (hp && (relOf(G, pid, hp.id) === 'alliance' || favOf(G, hp.id, pid) > 1)) q.push({ type: 'help', to: hp.id, target: target.id });
+    }
+  }
   if (warList.length && P.money >= 60 && rnd(G) < 0.35) {
     const target = warList.slice().sort((a, b) => S[b.id] - S[a.id])[0];
     const cand = others.filter(p => p.id !== target.id && relOf(G, pid, p.id) !== 'war' && relOf(G, p.id, target.id) === 'peace' && !hasProp(G, pid, p.id, 'hire') && !onCooldown(G, pid, p.id) && lockLeft(G, p.id, target.id) === 0)
@@ -1420,17 +1991,17 @@ function planDiplomacy(G, pid) {
   //    (мощь = клетки, фермы, войска, деньги в казне). Союзники жертвы вступят в войну — учитываем их 60% мощи.
   const activeWars = warList.filter(w => touch(w.id) || reach(w.id));
   const threatened = warList.some(w => touch(w.id) && S[w.id] > 0.9 * mine);
-  const maxWars = 1 + (mine > 1.6 * avg ? 1 : 0);
+  const maxWars = 1 + (mine > 1.6 * avg || hoardNow ? 1 : 0);
   if (!threatened && activeWars.length < maxWars) {
     const neutralNear = [...G.tiles.values()].filter(t => t.owner < 0 && !t.tree && nbrs(G, t).some(n => n.owner === pid)).length;
     // «зуд» войны: чем больше накопленной казны, тем смелее бот — деньги превращаются в армию в день объявления войны
-    const itch = Math.min(2.5, P.money / Math.max(40, 5 * Math.max(10, e.net)));
-    const need = Math.max(0.7, (G.round > 70 ? 1.0 : G.round > 35 ? 1.15 : 1.4) - 0.22 * itch);
+    const itch = Math.min(4, P.money / Math.max(40, 5 * Math.max(10, e.net)));
+    const need = Math.max(0.5, (G.round > 70 ? 1.0 : G.round > 35 ? 1.15 : 1.4) - 0.22 * itch);
     const teamMine = mine + 0.5 * (myAl ? myAl.members.filter(m => m !== pid && G.players[m].alive).reduce((s, m) => s + S[m], 0) : 0);
     const cands = others.filter(p => relOf(G, pid, p.id) === 'peace' && lockLeft(G, pid, p.id) === 0 && reach(p.id) && teamMine >= need * teamPower(p.id))
       .sort((a, b) => teamPower(a.id) - teamPower(b.id));
     const pick = cands.find(p => (touch(p.id) || P.money >= 90) && !(neutralNear > 6 && G.round < 25));
-    if (pick && rnd(G) < (G.round > 40 ? 0.55 : 0.3)) q.push({ type: 'war', to: pick.id });
+    if (pick && rnd(G) < (hoardNow ? 0.9 : G.round > 40 ? 0.55 : 0.3)) q.push({ type: 'war', to: pick.id });
     else if (myAl && !pick) {                                    // помощь союзнику: он воюет с X, а мы с X в мире — присоединяемся (по желанию)
       const helpFor = others.find(p => relOf(G, pid, p.id) === 'peace' && lockLeft(G, pid, p.id) === 0 && !isMember(p.id) && reach(p.id)
         && myAl.members.some(m => m !== pid && relOf(G, m, p.id) === 'war') && teamMine >= 0.8 * teamPower(p.id));
@@ -1443,20 +2014,23 @@ function planDiplomacy(G, pid) {
 // ---------- флот: бот перевозит солдат, когда на своём острове места не осталось ----------
 function ownShips(G, pid) { const out = []; for (const s of G.sea.values()) if (s.ship && s.ship.owner === pid) out.push(s); return out; }
 function hasLandFront(G, c) {
-  if (c.landFront === undefined) c.landFront = c.mine.some(t => nbrs(G, t).some(n => n.owner < 0 || c.war.has(n.owner)));
+  // фронт считается только на основной территории: в отрезанных кусках своя (часто пустая) казна, нанять там войско на деньги страны нельзя — а значит, нужен флот
+  if (c.landFront === undefined) c.landFront = c.mine.some(t => !t.f && nbrs(G, t).some(n => n.owner < 0 || c.war.has(n.owner)));
   return c.landFront;
 }
 function landingTargets(G, c) {
   if (!c.landing) {
     c.landing = [];
-    for (const t of G.tiles.values()) if ((t.owner < 0 || c.war.has(t.owner)) && !t.tree && seaNbrs(G, t).length > 0) c.landing.push(t);
+    homeDist(G, c, null);                                           // строим карту «нашего» моря: берег чужого озера, куда корабль не доплывёт, целью не считается
+    for (const t of G.tiles.values()) if ((t.owner < 0 || c.war.has(t.owner)) && !t.tree && seaNbrs(G, t).some(x => c.homeD.has(x))) c.landing.push(t);
   }
   return c.landing;
 }
-function neededType(G, c) {
-  let minDef = 9;
-  for (const t of landingTargets(G, c)) { if (t.owner < 0) { minDef = 0; break; } minDef = Math.min(minDef, tileDef(G, t)); }
-  return Math.min(4, Math.max(1, (minDef === 9 ? 0 : minDef) + 1));
+function neededType(G, c, rich) {
+  const defs = landingTargets(G, c).map(t => t.owner < 0 ? 0 : tileDef(G, t)).sort((a, b) => a - b);
+  if (!defs.length) return 1;
+  const k = Math.min(4, Math.max(1, defs[Math.floor((defs.length - 1) * 0.35)] + 1));      // берём такого солдата, который пробьёт защиту хотя бы трети берега (а не одной случайной клетки)
+  return rich ? Math.max(k, 3) : k;            // богатый бот возит сразу Барона/Рыцаря: слабого десанта под башнями хватает ненадолго
 }
 function seaBfs(G, sources) {
   const d = new Map(), q = [];
@@ -1464,15 +2038,29 @@ function seaBfs(G, sources) {
   for (let i = 0; i < q.length; i++) for (const n of seaNbrs(G, q[i])) if (!d.has(n)) { d.set(n, d.get(q[i]) + 1); q.push(n); }
   return d;
 }
-function nearestLanding(G, c, st) {
-  if (!c.landD) { const src = []; for (const t of landingTargets(G, c)) for (const s of seaNbrs(G, t)) src.push(s); c.landD = seaBfs(G, src); }
-  const v = c.landD.get(st); return v === undefined ? 99 : v;
+// расстояние по воде до ближайшего места высадки, где солдат с атакой atk действительно сможет захватить клетку
+function nearestLanding(G, c, st, atk) {
+  atk = atk || 1;
+  if (!c.landDk) c.landDk = {};
+  if (!c.landDk[atk]) { const src = []; for (const t of landingTargets(G, c)) if (CFG.units[atk] ? CFG.units[atk].atk > tileDef(G, t) : true) for (const s of seaNbrs(G, t)) if (!s.ship) src.push(s); c.landDk[atk] = seaBfs(G, src); }     // занятые кораблями клетки у берега не считаем — туда не встать
+  const v = c.landDk[atk].get(st); return v === undefined ? 99 : v;
 }
 function homeDist(G, c, st) {
   if (!c.homeD) { const src = []; for (const t of c.mine) for (const s of seaNbrs(G, t)) src.push(s); c.homeD = seaBfs(G, src); }
   const v = c.homeD.get(st); return v === undefined ? 99 : v;
 }
 
+// свои клетки не дальше 3 шагов по своей земле от свободной клетки: оттуда нанятый солдат дойдёт до корабля
+function hireZone(G, c) {
+  if (c.hz) return c.hz;
+  const z = new Set(), dist = new Map(), q = [];
+  for (const t of c.mine) if (!t.unit && !t.building && !t.tree && !t.f) { dist.set(t, 0); q.push(t); z.add(t); }
+  for (let i = 0; i < q.length; i++) {
+    const t = q[i], d = dist.get(t); if (d >= 3) continue;
+    for (const n of nbrs(G, t)) if (n.owner === t.owner && !dist.has(n)) { dist.set(n, d + 1); z.add(n); q.push(n); }
+  }
+  return (c.hz = z);
+}
 function aiNaval(G, pid, c) {
   const P = G.players[pid], e = c.e, ships = ownShips(G, pid), land = landingTargets(G, c);
   if (!(ships.length > 0 || (!hasLandFront(G, c) && land.length > 0))) return null;
@@ -1496,7 +2084,7 @@ function aiNaval(G, pid, c) {
       if (!(n.owner < 0 || c.war.has(n.owner)) || atk <= tileDef(G, n)) continue;
       v = Math.max(v, captureValue(G, pid, n, n.owner < 0 ? 'claim' : 'attack', type, c));
     }
-    return v > 0.2 ? v : -nearestLanding(G, c, st) * 0.1 - 0.5;
+    return v > 0.2 ? v : -nearestLanding(G, c, st, type) * 0.1 - 0.5;
   };
   for (const s of ships) {
     const sh = s.ship; if (!sh.cargo || sh.moved) continue;
@@ -1505,24 +2093,33 @@ function aiNaval(G, pid, c) {
     if (best && best.v > here + 1e-9) return mv(s, best.st);
   }
   // 2a) застрявший слабый десант: распускаем корабль, чтобы снарядить сильнее
-  for (const s of ships) {
+  for (const s of ships) {                                          // десант, который не пробьёт защиту ни одной цели, — корабль списываем (лишнее содержание)
     const sh = s.ship;
-    if (sh.cargo && sh.cargo.type < localNeed(G, c, s) && applyDisbandOk(G, pid, s)) return applyAction(G, pid, { type: 'disband', tile: key(s.q, s.r) });
+    if (sh.cargo && land.every(t => CFG.units[sh.cargo.type].atk <= tileDef(G, t)) && applyDisbandOk(G, pid, s)) return applyAction(G, pid, { type: 'disband', tile: key(s.q, s.r) });
   }
-  // 2b) пустой корабль возвращается к своему берегу
+  // 2b) пустой корабль возвращается к своему берегу — к такому месту, где рядом со свободными клетками (там можно нанять и посадить солдата)
   const homeD = st => homeDist(G, c, st);
+  const zone = hireZone(G, c), spot = st => nbrs(G, st).some(n => zone.has(n)) ? 0 : 1;
+  const needNow = neededType(G, c, P.money > 400);
   for (const s of ships) {
     if (s.ship.cargo || s.ship.moved) continue;
-    const here = homeD(s) * 10 - (nbrs(G, s).length ? 0 : 0);
+    if (c.mine.some(t => t.unit && !t.unit.moved && t.unit.type >= needNow && t.unit.type < 5 && getMoves(G, t).get(s) === 'board')) continue;       // солдат уже готов к посадке
+    const score = st => spot(st) * 100 + homeD(st) * 10 + nearestLanding(G, c, st, 3) * 0.1;
+    const here = score(s);
     let best = null;
-    for (const [st] of getShipMoves(G, s)) {
-      const v = homeD(st) * 10 + nearestLanding(G, c, st) * 0.1;
-      if (!best || v < best.v) best = { v, st };
-    }
-    if (best && homeD(s) > 0 && best.v < here) return mv(s, best.st);
+    for (const [st] of getShipMoves(G, s)) { const v = score(st); if (!best || v < best.v) best = { v, st }; }
+    if (best && best.v < here - 1e-9) return mv(s, best.st);
   }
   // 3) садим подходящего солдата на пустой корабль
-  const need = neededType(G, c);
+  const need = neededType(G, c, P.money > 400);
+  if (land.length && ships.some(s => !s.ship.cargo) && !c.mine.some(t => !t.f && t.unit && t.unit.type >= need && t.unit.type < 5)) {         // сильных солдат нет — сливаем двух слабых в одного сильного
+    for (const t of c.mine) {
+      if (!t.unit || t.unit.moved || t.unit.type >= need || t.unit.type >= 4) continue;
+      const a = t.unit.type, delta = CFG.units[a + 1].upkeep - 2 * CFG.units[a].upkeep;
+      if (c.e.net - delta < 4 && P.money < 600) continue;
+      for (const [n, kind] of getMoves(G, t)) if (kind === 'merge') return mv(t, n);
+    }
+  }
   for (const s of ships) {
     if (s.ship.cargo || !land.length) continue;
     let pick = null;
@@ -1534,29 +2131,44 @@ function aiNaval(G, pid, c) {
   }
   if (!land.length) return null;
   // 4) строим корабль у берега, ближайшего к цели
-  const maxShips = 1 + (e.tiles >= 45 ? 1 : 0);
+  const maxShips = 1 + (e.tiles >= 45 ? 1 : 0) + (P.money > 250 + 8 * Math.max(0, e.net) ? 1 : 0) + (P.money > 900 ? 1 : 0) + (P.money > 900 ? Math.min(4, Math.floor((P.money - 900) / 500)) : 0);   // богатый бот строит флот побольше: деньги должны превращаться в десанты
   if (ships.length < maxShips && affordable(G, P, e, CFG.ship.cost, CFG.ship.upkeep)) {
     let best = null;
     for (const t of c.mine) for (const s of seaNbrs(G, t)) {
       if (s.ship) continue;
-      const v = nearestLanding(G, c, s) + rnd(G) * 0.3;
+      const v = nearestLanding(G, c, s, neededType(G, c, P.money > 400)) + rnd(G) * 0.3;
       if (!best || v < best.v) best = { v, t, s };
     }
     if (best) return applyAction(G, pid, { type: 'ship', tile: key(best.t.q, best.t.r), sea: key(best.s.q, best.s.r) });
   }
-  // 5) нанимаем солдата рядом с пустым кораблём
+  // 4b) сильный солдат есть, но стоит далеко от корабля — ведём его к берегу
+  if (P.money > 150) for (const s of ships) {
+    if (s.ship.cargo) continue;
+    if (c.mine.some(t => t.unit && t.unit.type >= need && t.unit.type < 5 && getMoves(G, t).get(s) === 'board')) continue;
+    let best = null;
+    for (const t of c.mine) {
+      if (!t.unit || t.unit.moved || t.unit.fresh || t.unit.type < need) continue;
+      const d0 = hexDist(t, s);
+      for (const [n, kind] of getMoves(G, t)) if (kind === 'move') { const d = hexDist(n, s); if (d < d0 && (!best || d < best.d)) best = { d, t, n }; }
+    }
+    if (best) return mv(best.t, best.n);
+  }
+  // 5) нанимаем солдата рядом с пустым кораблём (если рядом нет свободных клеток — на ближайшей свободной, дальше он дойдёт пешком)
   for (const s of ships) {
     if (s.ship.cargo) continue;
-    if (c.mine.some(t => t.unit && getMoves(G, t).get(s) === 'board')) continue;   // солдат для этого корабля уже есть
+    if (c.mine.some(t => t.unit && t.unit.type >= need && t.unit.type < 5 && getMoves(G, t).get(s) === 'board')) continue;   // подходящий солдат для этого корабля уже есть (слабый не считается — нужен тот, кто пробьёт защиту)
     const U = CFG.units[need];
     if (!affordable(G, P, e, U.cost, U.upkeep)) continue;
-    let bt = null, bd = 99;
+    let bt = null, bd = 99, direct = false;
     for (const t of c.mine) {
-      if (t.unit || t.building || t.tree) continue;
-      if (getMoves(G, t, { id: 0, type: need, owner: pid, moved: false }).get(s) !== 'board') continue;
-      const d = hexDist(t, s); if (d < bd) { bd = d; bt = t; }
+      if (t.unit || t.building || t.tree || t.f) continue;
+      const board = getMoves(G, t, { id: 0, type: need, owner: pid, moved: false }).get(s) === 'board';
+      const d = hexDist(t, s) + (board ? 0 : 30);
+      if (d < bd) { bd = d; bt = t; direct = board; }
     }
-    if (bt) return applyAction(G, pid, { type: 'buy', tile: key(bt.q, bt.r), unit: need });
+    if (!bt) continue;
+    if (!direct && c.mine.some(t => !t.f && t.unit && t.unit.type >= need && t.unit.type < 5)) continue;   // нужный солдат уже идёт к берегу
+    return applyAction(G, pid, { type: 'buy', tile: key(bt.q, bt.r), unit: need });
   }
   return null;
 }
@@ -1571,7 +2183,7 @@ function aiStep(G, pid) {
     if (r.ok) return r;
   }
   const c = aiCtx(G, pid);
-  for (const step of [aiDisband, aiCapture, aiNaval, aiDefend, aiFarm, aiTrim, aiFortify, aiBuy, aiPosition, aiMerge]) {
+  for (const step of [aiDisband, aiFire, aiCapture, aiNaval, aiDefend, aiFarm, aiUpgrade, aiTrim, aiFortify, aiCannon, aiBuy, aiClear, aiPosition, aiMerge]) {
     const r = step(G, pid, c);
     if (r && r.ok) return r;
   }
@@ -1588,9 +2200,9 @@ function localNeed(G, c, st) {
 }
 
 // ---- 99-export.js ----
-return { CFG, SHAPES, resLife, relUntil, termLeft, lockLeft, DIRS, key, hexDist, nbrs, seaNbrs, tileAt, newGame, serialize, deserialize, tileDef, econ, farmCost, farmSpotOk, buildCost, getMoves, getShipMoves, getUnloadMoves,
+return { CFG, SHAPES, resLife, relUntil, termLeft, lockLeft, DIRS, key, hexDist, nbrs, seaNbrs, tileAt, newGame, serialize, deserialize, tileDef, econ, fundsAt, fragCount, fragsOf, farmCost, farmSpotOk, buildCost, cannonCount, outpostTargets, getFireTargets, isFarm, getMoves, getShipMoves, getUnloadMoves,
   applyAction, aiStep, relOf, relSince, favOf, strength, allyGroup, RANK, botName, humanName, COLOR_ADJ, components,
-  allianceOf, disbandLeft, warLockLeft, allyBound, peaceBlock, joinPlan };
+  allianceOf, switchPlan, disbandLeft, warLockLeft, allyBound, aidVictim, peaceBlock, joinPlan, tradePartners, hasTrade, tradeCount, debtBetween };
 
 })()
 module.exports = HexCore;
